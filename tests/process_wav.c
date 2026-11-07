@@ -59,6 +59,10 @@ int main(int argc, char **argv)
 	const char *out_path = argv[3];
 	const char *mod = (argc > 4) ? argv[4] : "all";
 
+	/* Pre-load libm with RTLD_GLOBAL to resolve math symbols on libraries
+	   built with --as-needed */
+	dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+
 	void *handle = dlopen(lib_path, RTLD_NOW | RTLD_LOCAL);
 	if (!handle) {
 		fprintf(stderr, "Failed to load %s: %s\n", lib_path, dlerror());

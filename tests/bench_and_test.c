@@ -89,6 +89,10 @@ struct lib_api {
 
 static int load_api(const char *path, struct lib_api *api)
 {
+	/* Pre-load libm with RTLD_GLOBAL to resolve math symbols on libraries
+	   built with --as-needed */
+	dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+
 	api->handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 	if (!api->handle) {
 		fprintf(stderr, "Failed to load %s: %s\n", path, dlerror());

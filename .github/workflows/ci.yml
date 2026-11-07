@@ -38,7 +38,7 @@ jobs:
         run: |
           cd baseline
           make clean
-          make CROSS_COMPILE=mipsel-linux-gnu- LDFLAGS="-shared -lm -lpthread -fPIC -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--as-needed -flto -Wl,--version-script=src/libaudioProcess.map"
+          make CROSS_COMPILE=mipsel-linux-gnu- LDFLAGS="-shared -fPIC -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--no-as-needed -lm -lpthread -flto -Wl,--version-script=src/libaudioProcess.map"
           cp libaudioProcess.so ../libaudioProcess_baseline_mips.so
 
       - name: Build MIPS Candidate Shared Library
@@ -51,8 +51,8 @@ jobs:
       - name: Run MIPS Baseline vs Candidate Throughput Benchmark (QEMU)
         run: |
           cd candidate
-          mipsel-linux-gnu-gcc -std=c11 -D_GNU_SOURCE -Isrc -O2 tests/bench_and_test.c -ldl -lm -o tests/bench_mips
-          qemu-mipsel -L /usr/mipsel-linux-gnu ./tests/bench_mips ../libaudioProcess_baseline_mips.so ../libaudioProcess_candidate_mips.so
+          mipsel-linux-gnu-gcc -std=c11 -D_GNU_SOURCE -Isrc -O2 tests/bench_and_test.c -Wl,--no-as-needed -lm -ldl -o tests/bench_mips
+          qemu-mipsel -E LD_PRELOAD=/usr/mipsel-linux-gnu/lib/libm.so.6 -L /usr/mipsel-linux-gnu ./tests/bench_mips ../libaudioProcess_baseline_mips.so ../libaudioProcess_candidate_mips.so
 
       - name: Run TCD-VoIP & ViSQOL Quality Evaluation (Baseline vs Candidate)
         run: |

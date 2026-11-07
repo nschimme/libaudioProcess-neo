@@ -142,16 +142,16 @@ def main():
         process_bin_mips = args.process_bin + "_mips"
         if not os.path.exists(process_bin_mips):
             print(f"Compiling {process_bin_mips} for MIPS...")
-            res = subprocess.run(["mipsel-linux-gnu-gcc", "-std=c11", "-D_GNU_SOURCE", "-Isrc", "-O2", "tests/process_wav.c", "-ldl", "-lm", "-o", process_bin_mips])
+            res = subprocess.run(["mipsel-linux-gnu-gcc", "-std=c11", "-D_GNU_SOURCE", "-Isrc", "-O2", "tests/process_wav.c", "-Wl,--no-as-needed", "-lm", "-ldl", "-o", process_bin_mips])
             if res.returncode != 0:
                 print("Failed to compile process_wav tool for MIPS.")
                 sys.exit(1)
         args.process_bin = process_bin_mips
-        runner_cmd = ["qemu-mipsel", "-L", "/usr/mipsel-linux-gnu"]
+        runner_cmd = ["qemu-mipsel", "-E", "LD_PRELOAD=/usr/mipsel-linux-gnu/lib/libm.so.6", "-L", "/usr/mipsel-linux-gnu"]
     else:
         if not os.path.exists(args.process_bin):
             print(f"Compiling {args.process_bin} for host...")
-            res = subprocess.run(["gcc", "-std=c11", "-D_GNU_SOURCE", "-Isrc", "-O2", "tests/process_wav.c", "-ldl", "-lm", "-o", args.process_bin])
+            res = subprocess.run(["gcc", "-std=c11", "-D_GNU_SOURCE", "-Isrc", "-O2", "tests/process_wav.c", "-Wl,--no-as-needed", "-lm", "-ldl", "-o", args.process_bin])
             if res.returncode != 0:
                 print("Failed to compile process_wav tool.")
                 sys.exit(1)

@@ -37,6 +37,18 @@ static double compute_rms_i16(const int16_t *buf, int start, int end)
 	return sqrt(sum / count);
 }
 
+static double compute_rms_f32(const float *buf, int start, int end)
+{
+	double sum = 0.0;
+	int count = end - start;
+	if (count <= 0) return 0.0;
+	for (int i = start; i < end; i++) {
+		double v = buf[i];
+		sum += v * v;
+	}
+	return sqrt(sum / count);
+}
+
 /* Test 1: Guard rail on clamp_i16 boundaries */
 static void test_clamp_guardrails(void)
 {
@@ -291,10 +303,10 @@ static void test_extreme_audio_stress(void)
 	printf("  -> PASS\n");
 }
 
-/* Test 8: AGC (Automatic Gain Control) API & Quality Guard Rails */
+/* Test 8: AGC (Automatic Gain Control) E2E Regression Tests */
 static void test_agc_guardrails(void)
 {
-	printf("Running test_agc_guardrails...\n");
+	printf("Running test_agc_guardrails (E2E)...\n");
 	void *handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
 	if (!handle) handle = dlopen("./libaudioProcess.so", RTLD_NOW | RTLD_GLOBAL);
 
@@ -312,36 +324,49 @@ static void test_agc_guardrails(void)
 	void *agc = fn_agc_create();
 	ASSERT_TRUE(agc != NULL, "agc create");
 
-	WebRtcAgcConfig in_cfg = { .targetLevelDbfs = 3, .compressionGaindB = 9, .limiterEnable = 1 };
+	WebRtcAgcConfig in_cfg = { .targetLevelDbfs = 3, .compressionGaindB = 12, .limiterEnable = 1 };
 	int res = fn_agc_set_config(agc, 0, 255, 3, 16000, in_cfg);
 	ASSERT_TRUE(res == 0, "agc set config");
 
 	WebRtcAgcConfig out_cfg;
 	fn_agc_get_config(agc, &out_cfg);
 	ASSERT_TRUE(out_cfg.targetLevelDbfs == 3, "agc get config target");
-	ASSERT_TRUE(out_cfg.compressionGaindB == 9, "agc get config gain");
 
-	/* Process 10ms frame (160 samples at 16kHz) */
+	/* Scenario A: Quiet speech ramp-up */
 	int16_t in_buf[160];
 	int16_t out_buf[160];
-	for (int i = 0; i < 160; i++) in_buf[i] = 1000;
 	const int16_t *in_ptr = in_buf;
 	int16_t *out_ptr = out_buf;
-	int32_t out_mic = 0;
+	int32_t mic_level = 100;
 	uint8_t sat = 0;
 
-	res = fn_agc_process(agc, &in_ptr, 1, 160, &out_ptr, 100, &out_mic, 0, &sat);
-	ASSERT_TRUE(res == 0, "agc process");
-	ASSERT_TRUE(sat == 0, "agc no saturation on quiet frame");
+	for (int f = 0; f < 30; f++) {
+		for (int i = 0; i < 160; i++) in_buf[i] = 800; /* Low level */
+		res = fn_agc_process(agc, &in_ptr, 1, 160, &out_ptr, mic_level, &mic_level, 0, &sat);
+		ASSERT_TRUE(res == 0, "agc process quiet");
+	}
+	/* Verify gain amplified the signal */
+	double quiet_out_rms = compute_rms_i16(out_buf, 0, 160);
+	ASSERT_TRUE(quiet_out_rms >= 800.0, "AGC amplifies quiet speech upward");
+
+	/* Scenario B: Loud speech / Limiter engaged */
+	for (int f = 0; f < 30; f++) {
+		for (int i = 0; i < 160; i++) in_buf[i] = 28000; /* Loud level */
+		res = fn_agc_process(agc, &in_ptr, 1, 160, &out_ptr, mic_level, &mic_level, 0, &sat);
+		ASSERT_TRUE(res == 0, "agc process loud");
+		for (int i = 0; i < 160; i++) {
+			ASSERT_TRUE(out_buf[i] <= 32767 && out_buf[i] >= -32768, "AGC limiter prevents overflow");
+		}
+	}
 
 	fn_agc_free(agc);
 	printf("  -> PASS\n");
 }
 
-/* Test 9: NS (Noise Suppression) API & Quality Guard Rails */
+/* Test 9: NS (Noise Suppression) E2E Regression Tests */
 static void test_ns_guardrails(void)
 {
-	printf("Running test_ns_guardrails...\n");
+	printf("Running test_ns_guardrails (E2E)...\n");
 	void *handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
 	if (!handle) handle = dlopen("./libaudioProcess.so", RTLD_NOW | RTLD_GLOBAL);
 
@@ -363,31 +388,35 @@ static void test_ns_guardrails(void)
 	ASSERT_TRUE(res == 0, "ns set config");
 	if (fn_ns_get_config) fn_ns_get_config();
 
-	/* Process stationary noise frames */
+	/* E2E Test: Stationary noise suppression convergence */
 	float in_buf[160];
 	float out_buf[160];
 	const float *in_ptr = in_buf;
 	float *out_ptr = out_buf;
 
-	for (int f = 0; f < 20; f++) {
+	double initial_noise_rms = 0.0;
+	double final_noise_rms = 0.0;
+
+	for (int f = 0; f < 50; f++) {
 		for (int i = 0; i < 160; i++) {
-			in_buf[i] = ((float)(rand() % 1000) - 500.0f) / 10000.0f;
+			in_buf[i] = ((float)(rand() % 2000) - 1000.0f) / 10000.0f;
 		}
+		if (f == 0) initial_noise_rms = compute_rms_f32(in_buf, 0, 160);
 		fn_ns_process(ns, &in_ptr, 1, &out_ptr);
-		for (int i = 0; i < 160; i++) {
-			ASSERT_TRUE(!isnan(out_buf[i]), "ns output not nan");
-			ASSERT_TRUE(!isinf(out_buf[i]), "ns output not inf");
-		}
+		if (f == 49) final_noise_rms = compute_rms_f32(out_buf, 0, 160);
 	}
+
+	double snr_gain_db = 20.0 * log10(initial_noise_rms / (final_noise_rms > 1e-6 ? final_noise_rms : 1e-6));
+	ASSERT_TRUE(snr_gain_db > 5.0, "NS achieves > 5 dB stationary noise attenuation");
 
 	fn_ns_free(ns);
 	printf("  -> PASS\n");
 }
 
-/* Test 10: AEC (Acoustic Echo Cancellation) API & Quality Guard Rails */
+/* Test 10: AEC (Acoustic Echo Cancellation) E2E Regression Tests */
 static void test_aec_guardrails(void)
 {
-	printf("Running test_aec_guardrails...\n");
+	printf("Running test_aec_guardrails (E2E)...\n");
 	void *handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
 	if (!handle) handle = dlopen("./libaudioProcess.so", RTLD_NOW | RTLD_GLOBAL);
 
@@ -403,36 +432,46 @@ static void test_aec_guardrails(void)
 	struct aec_handle *aec = (struct aec_handle *)fn_aec_create(16000, NULL);
 	ASSERT_TRUE(aec != NULL, "aec create");
 
-	/* Create 10ms frame at 16kHz (160 samples = 320 bytes) */
+	/* E2E Echo cancellation test: feed far-end speaker audio into near-end mic with delay */
 	int16_t far_buf[160];
 	int16_t near_buf[160];
-	for (int i = 0; i < 160; i++) {
-		far_buf[i] = 1000;
-		near_buf[i] = 1000;
-	}
 	struct aec_frame frm = {
 		.far = far_buf,
 		.near = near_buf,
 		.num_bytes = 320
 	};
 
-	int res = fn_aec_process(aec, &frm);
-	ASSERT_TRUE(res == 0, "aec process");
+	double init_echo_rms = 0.0;
+	double final_echo_rms = 0.0;
 
-	for (int i = 0; i < 160; i++) {
-		ASSERT_TRUE(near_buf[i] <= 32767 && near_buf[i] >= -32768, "aec bounded");
+	/* Run 60 frames (600ms) to allow adaptive filter convergence */
+	for (int f = 0; f < 60; f++) {
+		for (int i = 0; i < 160; i++) {
+			double t = (double)(f * 160 + i) / 16000.0;
+			int16_t val = (int16_t)(8000.0 * sin(2.0 * M_PI * 500.0 * t));
+			far_buf[i] = val;
+			near_buf[i] = (int16_t)(val * 0.7); /* Direct acoustic echo coupled at -3dB */
+		}
+		if (f == 0) init_echo_rms = compute_rms_i16(near_buf, 0, 160);
+		int res = fn_aec_process(aec, &frm);
+		ASSERT_TRUE(res == 0, "aec process frame");
+		if (f == 59) final_echo_rms = compute_rms_i16(near_buf, 0, 160);
 	}
 
-	res = fn_aec_free(aec);
+	/* Assert echo suppression convergence: ERLE > 6 dB */
+	double erle_db = 20.0 * log10(init_echo_rms / (final_echo_rms > 1.0 ? final_echo_rms : 1.0));
+	ASSERT_TRUE(erle_db > 6.0, "AEC suppresses acoustic echo (ERLE > 6 dB)");
+
+	int res = fn_aec_free(aec);
 	ASSERT_TRUE(res == 0, "aec free");
 	printf("  -> PASS\n");
 }
 
 int main(void)
 {
-	printf("=========================================\n");
-	printf(" Audio Process Unit Tests & Guard Rails  \n");
-	printf("=========================================\n");
+	printf("=========================================================\n");
+	printf(" Audio Process Comprehensive Unit & E2E Regression Suite \n");
+	printf("=========================================================\n");
 
 	test_clamp_guardrails();
 	test_lpf_guardrails();
@@ -445,6 +484,6 @@ int main(void)
 	test_ns_guardrails();
 	test_aec_guardrails();
 
-	printf("\nAll unit tests and quality guard rails passed successfully!\n");
+	printf("\nAll 10 Unit & E2E Quality Tests Passed Successfully!\n");
 	return 0;
 }

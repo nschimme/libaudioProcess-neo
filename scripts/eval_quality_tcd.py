@@ -24,36 +24,36 @@ TCD_ZIP_URL = "https://codeload.github.com/nschimme/TCD-VOIP/zip/refs/tags/harte
 SCENARIOS = [
     # 1. Noise Suppression Scenarios (Male & Female voices, different noise environments)
     ("Noise Supp (Male MK)", "ns",
-     "TCD-VOIP-harte2015tcd/ref/R_01_CLIP_MK.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/noise/ref/R_10_NOISE_MK.wav",
      "TCD-VOIP-harte2015tcd/Test Set/noise/C_10_NOISE_MK.wav",
      "Male speaker with background street/babble noise"),
 
     ("Noise Supp (Female ML)", "ns",
-     "TCD-VOIP-harte2015tcd/ref/R_01_COMPSPKR_ML.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/noise/ref/R_18_NOISE_ML.wav",
      "TCD-VOIP-harte2015tcd/Test Set/noise/C_18_NOISE_ML.wav",
      "Female speaker with ambient acoustic room noise"),
 
     # 2. Acoustic Echo Scenarios
     ("Echo Rejection (Female FG)", "all",
-     "TCD-VOIP-harte2015tcd/ref/R_01_ECHO_FG.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/echo/ref/R_15_ECHO_FG.wav",
      "TCD-VOIP-harte2015tcd/Test Set/echo/C_15_ECHO_FG.wav",
      "Far-end acoustic room echo coupled into microphone"),
 
     # 3. Dynamic Range & Clipping Protection
     ("Limiter Protection (FA)", "drc",
-     "TCD-VOIP-harte2015tcd/ref/R_01_CLIP_FA.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/clip/ref/R_01_CLIP_FA.wav",
      "TCD-VOIP-harte2015tcd/Test Set/clip/C_01_CLIP_FA.wav",
      "Speech with severe analog/digital clipping harmonics"),
 
     # 4. Clean Speech Transparency (Ensuring filters do not distort pristine voice)
     ("Clean Speech Trans (FA)", "all",
-     "TCD-VOIP-harte2015tcd/ref/R_01_COMPSPKR_FA.wav",
-     "TCD-VOIP-harte2015tcd/ref/R_01_COMPSPKR_FA.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/compspkr/ref/R_01_COMPSPKR_FA.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/compspkr/ref/R_01_COMPSPKR_FA.wav",
      "Pristine studio speech; checks absence of processing distortion"),
 
     ("Clean Speech Trans (MK)", "all",
-     "TCD-VOIP-harte2015tcd/ref/R_01_CLIP_MK.wav",
-     "TCD-VOIP-harte2015tcd/ref/R_01_CLIP_MK.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/clip/ref/R_01_CLIP_MK.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/clip/ref/R_01_CLIP_MK.wav",
      "Pristine male speech; checks harmonic fidelity"),
 ]
 

@@ -10,6 +10,7 @@
 static inline float drc_gain_inline(float threshold, float knee, float ratio,
 				    float knee_range_inv, float level)
 {
+	/* Fast-path uncompressed levels */
 	if (level <= threshold || level < 1e-10f)
 		return 1.0f;
 
@@ -31,7 +32,7 @@ float drc_compute_gain(struct drc_eq_state *s, float level)
 	return drc_gain_inline(s->threshold, s->knee, s->ratio, range_inv, level);
 }
 
-void drc_process(struct drc_eq_state *s, float *buf, int n)
+void drc_process(struct drc_eq_state *s, float * __restrict__ buf, int n)
 {
 	const float inv_scale = 1.0f / 32768.0f;
 	const float attack_coeff = s->attack_coeff;
@@ -43,13 +44,16 @@ void drc_process(struct drc_eq_state *s, float *buf, int n)
 	float range_inv = range > 1e-10f ? (1.0f / range) : 0.0f;
 	float env = s->envelope;
 
-	float *p = buf;
+	float * __restrict__ p = buf;
 	for (int i = 0; i < n; i++) {
 		float val = *p;
 		float level = fabsf(val) * inv_scale;
 		float coeff = (level > env) ? attack_coeff : release_coeff;
 		env += coeff * (level - env);
-		*p++ = val * drc_gain_inline(threshold, knee, ratio, range_inv, env);
+		if (env > threshold) {
+			val *= drc_gain_inline(threshold, knee, ratio, range_inv, env);
+		}
+		*p++ = val;
 	}
 	s->envelope = env;
 }
@@ -101,7 +105,7 @@ int audio_process_drc_set_config(void *handle, int threshold, int knee,
 	return 0;
 }
 
-void audio_process_drc_process(void *handle, int16_t *data, int num_samples)
+void audio_process_drc_process(void *handle, int16_t * __restrict__ data, int num_samples)
 {
 	struct drc_eq_state *s = handle;
 	if (!s || !data || num_samples <= 0)
@@ -117,14 +121,18 @@ void audio_process_drc_process(void *handle, int16_t *data, int num_samples)
 	float range_inv = range > 1e-10f ? (1.0f / range) : 0.0f;
 	float env = s->envelope;
 
-	int16_t *p = data;
+	int16_t * __restrict__ p = data;
 	for (int i = 0; i < num_samples; i++) {
 		float sample = (float)*p;
 		float level = fabsf(sample) * inv_scale;
 		float coeff = (level > env) ? attack_coeff : release_coeff;
 		env += coeff * (level - env);
-		sample *= drc_gain_inline(threshold, knee, ratio, range_inv, env);
-		*p++ = clamp_i16(sample);
+		if (env > threshold) {
+			sample *= drc_gain_inline(threshold, knee, ratio, range_inv, env);
+			*p++ = clamp_i16(sample);
+		} else {
+			p++;
+		}
 	}
 	s->envelope = env;
 }

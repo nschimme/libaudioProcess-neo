@@ -54,14 +54,21 @@ static void hd_init_window(float *w, int n)
 
 static void hd_compute_spectrum(struct hd_state *s, const int16_t *frame)
 {
-	float *fft_buf = s->fft_buf;
-	const float *window = s->window;
-	for (int i = 0; i < HD_FFT_SIZE; i++)
-		fft_buf[i] = (float)frame[i] * window[i];
+	float * __restrict__ fft_buf = s->fft_buf;
+	const float * __restrict__ window = s->window;
+	const int16_t * __restrict__ frm = frame;
+
+	/* Unroll 4x for vector-pipeline parallelism */
+	for (int i = 0; i < HD_FFT_SIZE; i += 4) {
+		fft_buf[i + 0] = (float)frm[i + 0] * window[i + 0];
+		fft_buf[i + 1] = (float)frm[i + 1] * window[i + 1];
+		fft_buf[i + 2] = (float)frm[i + 2] * window[i + 2];
+		fft_buf[i + 3] = (float)frm[i + 3] * window[i + 3];
+	}
 
 	WebRtc_rdft(HD_FFT_SIZE, 1, fft_buf, s->fft_ip, s->fft_w);
 
-	float *spectrum = s->spectrum;
+	float * __restrict__ spectrum = s->spectrum;
 	spectrum[0] = fabsf(fft_buf[0]);
 	for (int k = 1; k < HD_HALF_FFT; k++) {
 		float re = fft_buf[2 * k];

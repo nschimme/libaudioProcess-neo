@@ -8,7 +8,7 @@ CFLAGS += -fPIC -DMIPS_FPU_LE -DWEBRTC_POSIX -Isrc
 CFLAGS += -ffunction-sections -fdata-sections -flto
 CFLAGS += -fno-asynchronous-unwind-tables -fmerge-all-constants -fno-ident
 
-LDFLAGS  = -shared -lm -lpthread
+LDFLAGS  = -shared -lm -lpthread -fPIC
 LDFLAGS += -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--as-needed -flto
 LDFLAGS += -Wl,--version-script=$(SRCDIR)/libaudioProcess.map
 
@@ -95,4 +95,12 @@ size: $(TARGET)
 	@echo "Exported symbols:"
 	@nm -D --defined-only $(TARGET) | grep -c ' T '
 
-.PHONY: all clean size
+test:
+	gcc -std=c11 -D_GNU_SOURCE -O2 -Isrc src/biquad.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/webrtc/common_audio/fft4g.c src/webrtc/common_audio/signal_processing/copy_set_operations.c tests/unit_tests.c -lm -o tests/unit_tests_bin
+	./tests/unit_tests_bin
+	rm -f tests/unit_tests_bin
+	gcc -std=c11 -D_GNU_SOURCE -O2 -Isrc src/biquad.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/webrtc/common_audio/fft4g.c src/webrtc/common_audio/signal_processing/copy_set_operations.c tests/bench_and_test.c -lm -o tests/bench_x86
+	./tests/bench_x86
+	rm -f tests/bench_x86
+
+.PHONY: all clean size test

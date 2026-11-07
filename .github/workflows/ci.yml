@@ -1,0 +1,54 @@
+name: CI Benchmark & Quality Evaluation
+
+on:
+  push:
+    branches: [ main, "**" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout candidate branch
+        uses: actions/checkout@v4
+        with:
+          path: candidate
+
+      - name: Checkout baseline branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref || 'main' }}
+          path: baseline
+
+      - name: Install toolchains & QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-mipsel-linux-gnu binutils-mipsel-linux-gnu \
+                                  gcc-riscv64-linux-gnu libc6-dev-riscv64-cross \
+                                  qemu-user qemu-user-static
+
+      - name: Build MIPS Baseline Shared Library
+        run: |
+          cd baseline
+          make clean
+          make CROSS_COMPILE=mipsel-linux-gnu- LDFLAGS="-shared -lm -lpthread -fPIC -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--as-needed -flto -Wl,--version-script=src/libaudioProcess.map"
+          cp libaudioProcess.so ../libaudioProcess_baseline_mips.so
+
+      - name: Build MIPS Candidate Shared Library
+        run: |
+          cd candidate
+          make clean
+          make CROSS_COMPILE=mipsel-linux-gnu- size
+          cp libaudioProcess.so ../libaudioProcess_candidate_mips.so
+
+      - name: Run MIPS Baseline vs Candidate Library Evaluation (QEMU)
+        run: |
+          cd candidate
+          mipsel-linux-gnu-gcc -std=c11 -D_GNU_SOURCE -O2 tests/bench_lib.c -ldl -lm -o tests/bench_lib_mips
+          qemu-mipsel -L /usr/mipsel-linux-gnu ./tests/bench_lib_mips ../libaudioProcess_baseline_mips.so ../libaudioProcess_candidate_mips.so
+
+      - name: Run Candidate Self-Test & Benchmarks (x86_64)
+        run: |
+          cd candidate
+          make test

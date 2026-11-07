@@ -69,3 +69,47 @@ int16_t biquad_process_i16(struct biquad *bq, int16_t in)
 {
 	return clamp_i16(biquad_process(bq, (float)in));
 }
+
+void biquad_process_block_f32(struct biquad *bq, const float *in, float *out, int n)
+{
+	const float b0 = bq->b0;
+	const float b1 = bq->b1;
+	const float b2 = bq->b2;
+	const float a1 = bq->a1;
+	const float a2 = bq->a2;
+	float z1 = bq->z1;
+	float z2 = bq->z2;
+
+	for (int i = 0; i < n; i++) {
+		float x = in[i];
+		float y = b0 * x + z1;
+		z1 = b1 * x - a1 * y + z2;
+		z2 = b2 * x - a2 * y;
+		out[i] = y;
+	}
+
+	bq->z1 = z1;
+	bq->z2 = z2;
+}
+
+void biquad_process_block_i16(struct biquad *bq, const int16_t *in, int16_t *out, int n)
+{
+	const float b0 = bq->b0;
+	const float b1 = bq->b1;
+	const float b2 = bq->b2;
+	const float a1 = bq->a1;
+	const float a2 = bq->a2;
+	float z1 = bq->z1;
+	float z2 = bq->z2;
+
+	for (int i = 0; i < n; i++) {
+		float x = (float)in[i];
+		float y = b0 * x + z1;
+		z1 = b1 * x - a1 * y + z2;
+		z2 = b2 * x - a2 * y;
+		out[i] = clamp_i16(y);
+	}
+
+	bq->z1 = z1;
+	bq->z2 = z2;
+}

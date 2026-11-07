@@ -16,4 +16,7 @@ void biquad_reset(struct biquad *bq);
 float biquad_process(struct biquad *bq, float in);
 int16_t biquad_process_i16(struct biquad *bq, int16_t in);
 
+void biquad_process_block_f32(struct biquad *bq, const float *in, float *out, int n);
+void biquad_process_block_i16(struct biquad *bq, const int16_t *in, int16_t *out, int n);
+
 #endif

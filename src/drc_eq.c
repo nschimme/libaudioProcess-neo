@@ -69,8 +69,10 @@ void audio_process_drc_eq_process(void *handle, const float *const *in,
 	float *dst = out[0];
 	int n = s->frame_size;
 
-	for (int i = 0; i < n; i++)
-		dst[i] = src[i];
+	if (src != dst) {
+		for (int i = 0; i < n; i++)
+			dst[i] = src[i];
+	}
 
 	if (s->enabled_drc)
 		drc_process(s, dst, n);

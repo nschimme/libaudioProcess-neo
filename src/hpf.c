@@ -53,8 +53,7 @@ int audio_process_hpf_process(int16_t *state, int16_t *data, int num_samples)
 		bq->z2 = 0.0f;
 	}
 
-	for (int i = 0; i < num_samples; i++)
-		data[i] = biquad_process_i16(bq, data[i]);
+	biquad_process_block_i16(bq, data, data, num_samples);
 
 	return 0;
 }

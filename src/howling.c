@@ -27,10 +27,13 @@ struct hd_state {
 	float spectrum[HD_HALF_FFT];
 	int persist[HD_HALF_FFT];
 
-	/* detection thresholds (dB) */
+	/* detection thresholds (dB and linear factors) */
 	float ptpr_thr;
 	float papr_thr;
 	float pnpr_thr;
+	float ptpr_lin;
+	float papr_lin;
+	float pnpr_lin;
 
 	/* notch filters */
 	struct biquad notches[HD_MAX_NOTCHES];
@@ -77,10 +80,9 @@ static int hd_detect_candidates(struct hd_state *s, int *candidates)
 	if (avg < 1e-10f)
 		avg = 1e-10f;
 
-	const float ptpr_thr = s->ptpr_thr;
-	const float papr_thr = s->papr_thr;
-	const float pnpr_thr = s->pnpr_thr;
-	const float inv_avg = 1.0f / avg;
+	const float ptpr_lin = s->ptpr_lin;
+	const float papr_threshold = avg * s->papr_lin;
+	const float pnpr_lin = s->pnpr_lin;
 
 	int num = 0;
 	for (int k = 5; k < HD_HALF_FFT - 6; k++) {
@@ -88,9 +90,11 @@ static int hd_detect_candidates(struct hd_state *s, int *candidates)
 		if (mag < 1e-10f)
 			continue;
 
-		if (20.0f * log10f(mag) < ptpr_thr)
+		/* 20*log10(mag) < ptpr_thr <=> mag < 10^(ptpr_thr/20) */
+		if (mag < ptpr_lin)
 			continue;
-		if (20.0f * log10f(mag * inv_avg) < papr_thr)
+		/* 20*log10(mag/avg) < papr_thr <=> mag < avg * 10^(papr_thr/20) */
+		if (mag < papr_threshold)
 			continue;
 
 		int pass = 1;
@@ -98,7 +102,8 @@ static int hd_detect_candidates(struct hd_state *s, int *candidates)
 			float neighbor = spectrum[k + pnpr_offsets[n]];
 			if (neighbor < 1e-10f)
 				neighbor = 1e-10f;
-			if (20.0f * log10f(mag / neighbor) < pnpr_thr)
+			/* 20*log10(mag/neighbor) < pnpr_thr <=> mag < neighbor * 10^(pnpr_thr/20) */
+			if (mag < neighbor * pnpr_lin)
 				pass = 0;
 		}
 
@@ -166,6 +171,9 @@ void *audio_process_hs_create(int sample_rate, int frame_size)
 	s->ptpr_thr = 30.0f;
 	s->papr_thr = 15.0f;
 	s->pnpr_thr = 10.0f;
+	s->ptpr_lin = powf(10.0f, s->ptpr_thr / 20.0f);
+	s->papr_lin = powf(10.0f, s->papr_thr / 20.0f);
+	s->pnpr_lin = powf(10.0f, s->pnpr_thr / 20.0f);
 
 	hd_init_window(s->window, HD_FFT_SIZE);
 

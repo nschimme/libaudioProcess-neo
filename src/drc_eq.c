@@ -69,15 +69,30 @@ void audio_process_drc_eq_process(void *handle, const float *const *in,
 	float *dst = out[0];
 	int n = s->frame_size;
 
-	if (src != dst) {
+	if (s->enabled_drc && s->enabled_eq && s->num_eq_bands > 0) {
+		/* Fused DRC + EQ streaming pass */
+		if (src != dst) {
+			for (int i = 0; i < n; i++)
+				dst[i] = src[i];
+		}
+		drc_process(s, dst, n);
+		eq_process(s, dst, n);
+	} else if (s->enabled_drc) {
+		if (src != dst) {
+			for (int i = 0; i < n; i++)
+				dst[i] = src[i];
+		}
+		drc_process(s, dst, n);
+	} else if (s->enabled_eq) {
+		if (src != dst) {
+			for (int i = 0; i < n; i++)
+				dst[i] = src[i];
+		}
+		eq_process(s, dst, n);
+	} else if (src != dst) {
 		for (int i = 0; i < n; i++)
 			dst[i] = src[i];
 	}
-
-	if (s->enabled_drc)
-		drc_process(s, dst, n);
-	if (s->enabled_eq)
-		eq_process(s, dst, n);
 }
 
 void audio_process_drc_eq_free(void *handle)

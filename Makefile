@@ -28,9 +28,8 @@ AEC_SRC = $(addprefix $(SRCDIR)/webrtc/modules/audio_processing/aec/, \
 	aec_core.c aec_core_mips.c echo_cancellation.c \
 	aec_rdft.c aec_rdft_mips.c aec_resampler.c)
 
-# WebRTC AGC
-AGC_SRC = $(addprefix $(SRCDIR)/webrtc/modules/audio_processing/agc/legacy/, \
-	analog_agc.c digital_agc.c)
+# WebRTC AGC (Replaced by clean-room src/agc.c)
+AGC_SRC =
 
 # WebRTC NS
 NS_SRC = $(addprefix $(SRCDIR)/webrtc/modules/audio_processing/ns/, \
@@ -96,7 +95,7 @@ size: $(TARGET)
 	@nm -D --defined-only $(TARGET) | grep -c ' T '
 
 test:
-	gcc -std=c11 -D_GNU_SOURCE -O2 -Isrc src/biquad.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/webrtc/common_audio/fft4g.c src/webrtc/common_audio/signal_processing/copy_set_operations.c tests/unit_tests.c -ldl -lm -o tests/unit_tests_bin
+	gcc -std=c11 -D_GNU_SOURCE -O2 -rdynamic -Isrc src/agc.c src/biquad.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/webrtc/common_audio/fft4g.c src/webrtc/common_audio/signal_processing/copy_set_operations.c tests/unit_tests.c -ldl -lm -o tests/unit_tests_bin
 	./tests/unit_tests_bin
 	rm -f tests/unit_tests_bin
 

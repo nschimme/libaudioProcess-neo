@@ -101,6 +101,6 @@ test:
 	rm -f tests/unit_tests_bin
 
 bench:
-	gcc -std=c11 -D_GNU_SOURCE -O2 tests/bench.c -ldl -lm -o tests/bench_bin
+	gcc -std=c11 -D_GNU_SOURCE -O2 tests/bench_and_test.c -ldl -lm -o tests/bench_bin
 
 .PHONY: all clean size test bench

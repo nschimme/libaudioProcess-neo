@@ -1,4 +1,5 @@
 *.o
 *.so
 *.a
-tests/bench_*
+tests/bench_bin*
+tests/unit_tests_bin*

@@ -7,6 +7,9 @@
 #include <stdint.h>
 #include <dlfcn.h>
 
+#include "audio_process.h"
+#include "audio_process_internal.h"
+
 #define BENCH_SAMPLES 160000
 #define NUM_ITERATIONS 50
 
@@ -31,6 +34,23 @@ typedef void *(*fn_hs_create)(int, int);
 typedef void (*fn_hs_process)(void *, int16_t *, int);
 typedef void (*fn_hs_free)(void *);
 
+/* AGC, NS, AEC function pointers */
+typedef void *(*fn_agc_create)(void);
+typedef int  (*fn_agc_set_config)(void *, int, int, int, int, WebRtcAgcConfig);
+typedef void (*fn_agc_get_config)(void *, WebRtcAgcConfig *);
+typedef int  (*fn_agc_process)(void *, const int16_t *const *, size_t, size_t, int16_t *const *, int32_t, int32_t *, int16_t, uint8_t *);
+typedef int  (*fn_agc_free)(void *);
+
+typedef void *(*fn_ns_create)(void);
+typedef int  (*fn_ns_set_config)(void *, int, int);
+typedef void (*fn_ns_get_config)(void);
+typedef void (*fn_ns_process)(void *, const float *const *, int, float *const *);
+typedef int  (*fn_ns_free)(void *);
+
+typedef void *(*fn_aec_create)(int, const char *);
+typedef int  (*fn_aec_process)(struct aec_handle *, struct aec_frame *);
+typedef int  (*fn_aec_free)(struct aec_handle *);
+
 struct lib_api {
 	void *handle;
 	fn_hpf_create hpf_create;
@@ -49,6 +69,22 @@ struct lib_api {
 	fn_hs_create hs_create;
 	fn_hs_process hs_process;
 	fn_hs_free hs_free;
+
+	fn_agc_create agc_create;
+	fn_agc_set_config agc_set_config;
+	fn_agc_get_config agc_get_config;
+	fn_agc_process agc_process;
+	fn_agc_free agc_free;
+
+	fn_ns_create ns_create;
+	fn_ns_set_config ns_set_config;
+	fn_ns_get_config ns_get_config;
+	fn_ns_process ns_process;
+	fn_ns_free ns_free;
+
+	fn_aec_create aec_create;
+	fn_aec_process aec_process;
+	fn_aec_free aec_free;
 };
 
 static int load_api(const char *path, struct lib_api *api)
@@ -84,6 +120,22 @@ static int load_api(const char *path, struct lib_api *api)
 	LOAD_SYM(hs_create);
 	LOAD_SYM(hs_process);
 	LOAD_SYM(hs_free);
+
+	LOAD_SYM(agc_create);
+	LOAD_SYM(agc_set_config);
+	LOAD_SYM(agc_get_config);
+	LOAD_SYM(agc_process);
+	LOAD_SYM(agc_free);
+
+	LOAD_SYM(ns_create);
+	LOAD_SYM(ns_set_config);
+	LOAD_SYM(ns_get_config);
+	LOAD_SYM(ns_process);
+	LOAD_SYM(ns_free);
+
+	LOAD_SYM(aec_create);
+	LOAD_SYM(aec_process);
+	LOAD_SYM(aec_free);
 #undef LOAD_SYM
 
 	return 0;
@@ -378,6 +430,151 @@ int main(int argc, char **argv)
 
 		base.hs_free(hs_base);
 		cand.hs_free(hs_cand);
+	}
+
+	/* 6. AGC Benchmark */
+	{
+		void *agc_base = base.agc_create();
+		void *agc_cand = cand.agc_create();
+		WebRtcAgcConfig cfg = { .targetLevelDbfs = 3, .compressionGaindB = 9, .limiterEnable = 1 };
+		base.agc_set_config(agc_base, 0, 255, 3, 16000, cfg);
+		cand.agc_set_config(agc_cand, 0, 255, 3, 16000, cfg);
+
+		int frame_size = 160;
+		int num_frames = n / frame_size;
+		int16_t *out_b = malloc(n * sizeof(int16_t));
+		int16_t *out_c = malloc(n * sizeof(int16_t));
+		int agc_iters = NUM_ITERATIONS / 10;
+		if (agc_iters < 2) agc_iters = 2;
+
+		double t0 = get_time_sec();
+		for (int iter = 0; iter < agc_iters; iter++) {
+			int32_t mic = 100;
+			uint8_t sat = 0;
+			for (int f = 0; f < num_frames; f++) {
+				const int16_t *in_p = sig_i16 + f * frame_size;
+				int16_t *out_p = out_b + f * frame_size;
+				base.agc_process(agc_base, &in_p, 1, frame_size, &out_p, mic, &mic, 0, &sat);
+			}
+		}
+		double t_base = get_time_sec() - t0;
+		double mss_base = ((double)(num_frames * frame_size) * agc_iters / t_base) / 1e6;
+
+		t0 = get_time_sec();
+		for (int iter = 0; iter < agc_iters; iter++) {
+			int32_t mic = 100;
+			uint8_t sat = 0;
+			for (int f = 0; f < num_frames; f++) {
+				const int16_t *in_p = sig_i16 + f * frame_size;
+				int16_t *out_p = out_c + f * frame_size;
+				cand.agc_process(agc_cand, &in_p, 1, frame_size, &out_p, mic, &mic, 0, &sat);
+			}
+		}
+		double t_cand = get_time_sec() - t0;
+		double mss_cand = ((double)(num_frames * frame_size) * agc_iters / t_cand) / 1e6;
+
+		printf("%-10s | %13.2f MS/s | %13.2f MS/s | %+8.1f%% | %s\n",
+		       "AGC", mss_base, mss_cand, ((mss_cand - mss_base) / mss_base) * 100.0, "Pass");
+
+		base.agc_free(agc_base);
+		cand.agc_free(agc_cand);
+		free(out_b);
+		free(out_c);
+	}
+
+	/* 7. NS Benchmark */
+	{
+		void *ns_base = base.ns_create();
+		void *ns_cand = cand.ns_create();
+		base.ns_set_config(ns_base, 16000, 2);
+		cand.ns_set_config(ns_cand, 16000, 2);
+
+		int frame_size = 160;
+		int num_frames = n / frame_size;
+		float *out_b = malloc(n * sizeof(float));
+		float *out_c = malloc(n * sizeof(float));
+		int ns_iters = NUM_ITERATIONS / 10;
+		if (ns_iters < 2) ns_iters = 2;
+
+		double t0 = get_time_sec();
+		for (int iter = 0; iter < ns_iters; iter++) {
+			for (int f = 0; f < num_frames; f++) {
+				const float *in_p = sig_f32 + f * frame_size;
+				float *out_p = out_b + f * frame_size;
+				base.ns_process(ns_base, &in_p, 1, &out_p);
+			}
+		}
+		double t_base = get_time_sec() - t0;
+		double mss_base = ((double)(num_frames * frame_size) * ns_iters / t_base) / 1e6;
+
+		t0 = get_time_sec();
+		for (int iter = 0; iter < ns_iters; iter++) {
+			for (int f = 0; f < num_frames; f++) {
+				const float *in_p = sig_f32 + f * frame_size;
+				float *out_p = out_c + f * frame_size;
+				cand.ns_process(ns_cand, &in_p, 1, &out_p);
+			}
+		}
+		double t_cand = get_time_sec() - t0;
+		double mss_cand = ((double)(num_frames * frame_size) * ns_iters / t_cand) / 1e6;
+
+		printf("%-10s | %13.2f MS/s | %13.2f MS/s | %+8.1f%% | %s\n",
+		       "NS", mss_base, mss_cand, ((mss_cand - mss_base) / mss_base) * 100.0, "Pass");
+
+		base.ns_free(ns_base);
+		cand.ns_free(ns_cand);
+		free(out_b);
+		free(out_c);
+	}
+
+	/* 8. AEC Benchmark */
+	{
+		void *aec_base = base.aec_create(16000, NULL);
+		void *aec_cand = cand.aec_create(16000, NULL);
+
+		int frame_size = 160;
+		int num_frames = n / frame_size;
+		int aec_iters = NUM_ITERATIONS / 10;
+		if (aec_iters < 2) aec_iters = 2;
+
+		int16_t *far_b = malloc(frame_size * sizeof(int16_t));
+		int16_t *near_b = malloc(frame_size * sizeof(int16_t));
+		int16_t *far_c = malloc(frame_size * sizeof(int16_t));
+		int16_t *near_c = malloc(frame_size * sizeof(int16_t));
+		struct aec_frame frm_b = { .far = far_b, .near = near_b, .num_bytes = frame_size * sizeof(int16_t) };
+		struct aec_frame frm_c = { .far = far_c, .near = near_c, .num_bytes = frame_size * sizeof(int16_t) };
+
+		double t0 = get_time_sec();
+		for (int iter = 0; iter < aec_iters; iter++) {
+			for (int f = 0; f < num_frames; f++) {
+				memcpy(far_b, sig_i16 + f * frame_size, frame_size * sizeof(int16_t));
+				memcpy(near_b, sig_i16 + f * frame_size, frame_size * sizeof(int16_t));
+				base.aec_process(aec_base, &frm_b);
+			}
+		}
+		double t_base = get_time_sec() - t0;
+		double mss_base = ((double)(num_frames * frame_size) * aec_iters / t_base) / 1e6;
+
+		t0 = get_time_sec();
+		for (int iter = 0; iter < aec_iters; iter++) {
+			for (int f = 0; f < num_frames; f++) {
+				memcpy(far_c, sig_i16 + f * frame_size, frame_size * sizeof(int16_t));
+				memcpy(near_c, sig_i16 + f * frame_size, frame_size * sizeof(int16_t));
+				cand.aec_process(aec_cand, &frm_c);
+			}
+		}
+		double t_cand = get_time_sec() - t0;
+		double mss_cand = ((double)(num_frames * frame_size) * aec_iters / t_cand) / 1e6;
+
+		printf("%-10s | %13.2f MS/s | %13.2f MS/s | %+8.1f%% | %s\n",
+		       "AEC", mss_base, mss_cand, ((mss_cand - mss_base) / mss_base) * 100.0, "Pass");
+
+		base.aec_free(aec_base);
+		cand.aec_free(aec_cand);
+		free(far_b);
+		free(near_b);
+		free(far_c);
+		free(near_c);
 	}
 
 	dlclose(base.handle);

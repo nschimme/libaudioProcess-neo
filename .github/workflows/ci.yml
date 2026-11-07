@@ -50,5 +50,5 @@ jobs:
       - name: Run MIPS Baseline vs Candidate Library Evaluation (QEMU)
         run: |
           cd candidate
-          mipsel-linux-gnu-gcc -std=c11 -D_GNU_SOURCE -O2 tests/bench_and_test.c -ldl -lm -o tests/bench_mips
+          mipsel-linux-gnu-gcc -std=c11 -D_GNU_SOURCE -Isrc -O2 tests/bench_and_test.c -ldl -lm -o tests/bench_mips
           qemu-mipsel -L /usr/mipsel-linux-gnu ./tests/bench_mips ../libaudioProcess_baseline_mips.so ../libaudioProcess_candidate_mips.so

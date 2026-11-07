@@ -8,8 +8,8 @@ CFLAGS += -fPIC -DMIPS_FPU_LE -DWEBRTC_POSIX -Isrc
 CFLAGS += -ffunction-sections -fdata-sections -flto
 CFLAGS += -fno-asynchronous-unwind-tables -fmerge-all-constants -fno-ident
 
-LDFLAGS  = -shared -lm -lpthread -fPIC
-LDFLAGS += -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--as-needed -flto
+LDFLAGS  = -shared -fPIC
+LDFLAGS += -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--no-as-needed -lm -lpthread -flto
 LDFLAGS += -Wl,--version-script=$(SRCDIR)/libaudioProcess.map
 
 AR      = $(CROSS_COMPILE)ar

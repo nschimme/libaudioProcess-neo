@@ -80,6 +80,8 @@ The replacement algorithms strictly adhere to the existing public function inter
 - **Coherence-Based Double-Talk Detector (DTD)**:
   - Continuously calculates normalized cross-power spectral density between far-end speaker signal $x[n]$ and near-end microphone signal $d[n]$.
   - When cross-correlation drops below thresholds `cor_thd1..4`, near-end speech (double-talk) is detected, freezing filter updates to prevent filter divergence.
+  - **Chassis Acoustic Feedback & Mechanical Bleed Provision**:
+    In compact Thingino IP camera enclosures and video doorbells, the built-in speaker is located mere centimeters from the microphone capsule. High-amplitude speaker output vibrates the camera's plastic chassis and PCB, creating high-magnitude, non-linear structural acoustic feedback. Without compensation, this intense structural coupling can easily fool standard cross-correlation detectors into misclassifying echo as near-end speech, permanently freezing adaptive filter convergence during loud speaker playback. The DTD includes an adjustable structural coupling bias margin ($\Delta_{\text{chassis}} \approx 3\text{--}6\text{ dB}$) so that enclosure vibration does not trigger false double-talk states while still instantaneously freezing updates during genuine human near-end speech.
 - **Residual Echo Suppression**:
   - When `nlp_mode` is set (0=conservative, 1=moderate, 2=aggressive), attenuation is scaled during single-talk periods, matching Ingenic's `safe_suppression` parameter.
 - **Complexity**: ~500 lines of C11 vs. 7,000 lines of WebRTC AEC.
@@ -103,7 +105,11 @@ The replacement algorithms strictly adhere to the existing public function inter
 
 ## 4. Specific Black-Box Oracle Requirements & Acceptance Criteria
 
-To ensure clean-room replacements for AEC, AGC, and NS match or exceed WebRTC while guaranteeing zero behavioral regressions, replacement candidates must satisfy strict numerical and qualitative acceptance gates.
+### 4.0 Core Principle: The Oracle is a Floor, Not a Rigid Ceiling
+The empirical oracle measurements detailed below define the **minimum acceptable baseline (floor)**. WebRTC M47 carries historical design compromises from 2008-era PC VoIP drivers. Clean-room C11 implementations are permitted—and explicitly expected—to surpass the oracle where modern signal processing excels:
+- **Eradicating "musical noise"**: Modern spectral estimators must produce smooth, artifact-free noise floors rather than the swirling tone bursts typical of early spectral subtraction.
+- **Dynamic AGC Transparency**: Faster transient response with zero pumping artifacts.
+- **Linearity & Stability**: Elimination of unnecessary subband splitting phase distortion.
 
 ### 4.1 Empirical Oracle Baseline Measurements
 
@@ -127,7 +133,9 @@ Tested on stationary Gaussian noise at 16 kHz:
 
 #### C. AEC Empirical Oracle Profile
 Tested with 20ms acoustic echo delay coupled at -4.4 dB ($0.6\times$ amplitude):
-- **Echo Return Loss Enhancement (ERLE)**: **70.0 dB** steady-state suppression on synthetic stationary echo; **> 18 dB** in dynamic speech.
+- **Echo Return Loss Enhancement (ERLE)**:
+  - **Synthetic Simulation (Zero-Noise)**: **70.0 dB** steady-state suppression on perfect linear simulation.
+  - **Physical Camera Hardware Expectations**: In real Thingino camera hardware, analog microphone preamp noise, ADC/DAC quantization, speaker harmonic distortion, and room reverberation limit raw linear ERLE to **30–40 dB**. The evaluation test suite explicitly distinguishes between synthetic verification checks and physical hardware target gates.
 - **Convergence Time**: Reaches > 15 dB ERLE within 40 frames (400 ms).
 
 ---
@@ -150,9 +158,11 @@ Any clean-room replacement must match the empirical transfer functions of the or
    - MIPS throughput must exceed **> 0.8 MSamples/s** (WebRTC baseline is bottlenecked at ~0.10 MS/s).
 
 3. **AEC Acceptance Gates**:
-   - Steady-state ERLE on single-talk far-end echo must exceed **> 25 dB**.
+   - **Steady-State ERLE on Single-Talk Far-End Echo**:
+     - Synthetic test vector gate: **> 40 dB** (theoretical floor check).
+     - Acoustic chamber / degraded VoIP gate: **> 25 dB** (physical hardware expectation is 30–40 dB max).
    - Convergence time to 15 dB ERLE must be **< 500 ms**.
-   - Double-talk detection must freeze adaptation within **30 ms**, preserving near-end voice with **< 1.0 dB** distortion.
+   - Double-talk detection must freeze adaptation within **30 ms**, preserving near-end voice with **< 1.0 dB** distortion, while tolerating chassis acoustic feedback without false freezes.
    - MIPS throughput must exceed **> 0.15 MSamples/s** (WebRTC baseline is bottlenecked at ~0.01 MS/s).
 
 ### 4.4 Black-Box Oracle Verification Protocol

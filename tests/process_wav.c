@@ -125,7 +125,7 @@ int main(int argc, char **argv)
 			ns_set_cfg(ns, sample_rate, 2);
 			int frame_size = sample_rate / 100; /* 10ms */
 			int num_frames = num_samples / frame_size;
-			float in_f[480], out_f[480];
+			float in_f[480] = {0}, out_f[480] = {0};
 			const float *inp = in_f;
 			float *outp = out_f;
 

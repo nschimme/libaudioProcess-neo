@@ -133,12 +133,28 @@ def main():
 
     ensure_dataset(args.data_dir)
 
-    if not os.path.exists(args.process_bin):
-        print(f"Compiling {args.process_bin}...")
-        res = subprocess.run(["gcc", "-std=c11", "-D_GNU_SOURCE", "-Isrc", "-O2", "tests/process_wav.c", "-ldl", "-lm", "-o", args.process_bin])
-        if res.returncode != 0:
-            print("Failed to compile process_wav tool.")
-            sys.exit(1)
+    # Detect target architecture of the candidate library to choose runner and compiler
+    file_info = subprocess.check_output(["file", args.candidate_so]).decode("utf-8", errors="ignore")
+    is_mips = "MIPS" in file_info
+    runner_cmd = []
+
+    if is_mips:
+        process_bin_mips = args.process_bin + "_mips"
+        if not os.path.exists(process_bin_mips):
+            print(f"Compiling {process_bin_mips} for MIPS...")
+            res = subprocess.run(["mipsel-linux-gnu-gcc", "-std=c11", "-D_GNU_SOURCE", "-Isrc", "-O2", "tests/process_wav.c", "-ldl", "-lm", "-o", process_bin_mips])
+            if res.returncode != 0:
+                print("Failed to compile process_wav tool for MIPS.")
+                sys.exit(1)
+        args.process_bin = process_bin_mips
+        runner_cmd = ["qemu-mipsel", "-L", "/usr/mipsel-linux-gnu"]
+    else:
+        if not os.path.exists(args.process_bin):
+            print(f"Compiling {args.process_bin} for host...")
+            res = subprocess.run(["gcc", "-std=c11", "-D_GNU_SOURCE", "-Isrc", "-O2", "tests/process_wav.c", "-ldl", "-lm", "-o", args.process_bin])
+            if res.returncode != 0:
+                print("Failed to compile process_wav tool.")
+                sys.exit(1)
 
     print("\n=========================================================================================")
     print(f" TCD-VoIP Quality Evaluation: Baseline vs. Candidate")
@@ -163,9 +179,9 @@ def main():
         cand_out = os.path.join(out_dir, f"{os.path.basename(deg_p)}_{mod}_cand.wav")
 
         # Process through baseline
-        subprocess.run([args.process_bin, args.baseline_so, deg_file, base_out, mod], check=True)
+        subprocess.run(runner_cmd + [args.process_bin, args.baseline_so, deg_file, base_out, mod], check=True)
         # Process through candidate
-        subprocess.run([args.process_bin, args.candidate_so, deg_file, cand_out, mod], check=True)
+        subprocess.run(runner_cmd + [args.process_bin, args.candidate_so, deg_file, cand_out, mod], check=True)
 
         # ViSQOL MOS or SNR
         v_base = compute_visqol(ref_file, base_out)

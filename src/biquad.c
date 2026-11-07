@@ -39,7 +39,9 @@ void biquad_design_notch(struct biquad *bq, float fs, float freq, float bw)
 	if (sw < 1e-10f)
 		sw = 1e-10f;
 	float cw = cosf(w0);
-	float alpha = sw * sinhf(logf(2.0f) / 2.0f * bw * w0 / sw);
+	float x = logf(2.0f) / 2.0f * bw * w0 / sw;
+	float ex = expf(x);
+	float alpha = sw * (0.5f * (ex - 1.0f / ex));
 
 	float a0_inv = 1.0f / (1.0f + alpha);
 	bq->b0 = a0_inv;

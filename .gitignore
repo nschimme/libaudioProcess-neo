@@ -5,3 +5,4 @@ tests/bench_bin*
 tests/unit_tests_bin*
 tests/process_wav_bin*
 data/
+__pycache__/

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-TCD-VoIP & Objective Quality Evaluation Harness
-Evaluates Baseline vs Candidate shared libraries using TCD-VoIP speech datasets.
-Calculates ViSQOL MOS-LQO (if visqol-python is installed) and SNR / RMS improvements.
+TCD-VoIP & ViSQOL Objective Speech Quality Evaluation Harness
+Evaluates Baseline vs Candidate shared libraries across multiple real VoIP scenarios.
+Supports visqol-python (perceptual MOS-LQO 1.0 - 5.0) and objective SNR metrics.
+Publishes a rich Markdown summary table to GITHUB_STEP_SUMMARY.
 """
 
 import os
@@ -18,18 +19,48 @@ import subprocess
 
 TCD_ZIP_URL = "https://codeload.github.com/nschimme/TCD-VOIP/zip/refs/tags/harte2015tcd"
 
-# Curated evaluation pairs from TCD-VoIP: (condition_name, clean_ref, degraded_file)
-EVAL_PAIRS = [
-    ("Noise Suppression", "TCD-VOIP-harte2015tcd/ref/R_01_CLIP_MK.wav", "TCD-VOIP-harte2015tcd/Test Set/noise/C_10_NOISE_MK.wav"),
-    ("Echo Cancellation", "TCD-VOIP-harte2015tcd/ref/R_01_ECHO_FG.wav", "TCD-VOIP-harte2015tcd/Test Set/echo/C_15_ECHO_FG.wav"),
-    ("Clip Limiting",     "TCD-VOIP-harte2015tcd/ref/R_01_CLIP_FA.wav", "TCD-VOIP-harte2015tcd/Test Set/clip/C_01_CLIP_FA.wav"),
-    ("Clean Speech Trans", "TCD-VOIP-harte2015tcd/ref/R_01_COMPSPKR_FA.wav", "TCD-VOIP-harte2015tcd/ref/R_01_COMPSPKR_FA.wav"),
+# Comprehensive evaluation scenarios matching TCD-VoIP dataset structure:
+# Format: (Scenario Name, Submodule, Clean Ref, Degraded File, Description)
+SCENARIOS = [
+    # 1. Noise Suppression Scenarios (Male & Female voices, different noise environments)
+    ("Noise Supp (Male MK)", "ns",
+     "TCD-VOIP-harte2015tcd/ref/R_01_CLIP_MK.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/noise/C_10_NOISE_MK.wav",
+     "Male speaker with background street/babble noise"),
+
+    ("Noise Supp (Female ML)", "ns",
+     "TCD-VOIP-harte2015tcd/ref/R_01_COMPSPKR_ML.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/noise/C_18_NOISE_ML.wav",
+     "Female speaker with ambient acoustic room noise"),
+
+    # 2. Acoustic Echo Scenarios
+    ("Echo Rejection (Female FG)", "all",
+     "TCD-VOIP-harte2015tcd/ref/R_01_ECHO_FG.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/echo/C_15_ECHO_FG.wav",
+     "Far-end acoustic room echo coupled into microphone"),
+
+    # 3. Dynamic Range & Clipping Protection
+    ("Limiter Protection (FA)", "drc",
+     "TCD-VOIP-harte2015tcd/ref/R_01_CLIP_FA.wav",
+     "TCD-VOIP-harte2015tcd/Test Set/clip/C_01_CLIP_FA.wav",
+     "Speech with severe analog/digital clipping harmonics"),
+
+    # 4. Clean Speech Transparency (Ensuring filters do not distort pristine voice)
+    ("Clean Speech Trans (FA)", "all",
+     "TCD-VOIP-harte2015tcd/ref/R_01_COMPSPKR_FA.wav",
+     "TCD-VOIP-harte2015tcd/ref/R_01_COMPSPKR_FA.wav",
+     "Pristine studio speech; checks absence of processing distortion"),
+
+    ("Clean Speech Trans (MK)", "all",
+     "TCD-VOIP-harte2015tcd/ref/R_01_CLIP_MK.wav",
+     "TCD-VOIP-harte2015tcd/ref/R_01_CLIP_MK.wav",
+     "Pristine male speech; checks harmonic fidelity"),
 ]
 
 def ensure_dataset(data_dir):
     os.makedirs(data_dir, exist_ok=True)
     needed = []
-    for _, ref_p, deg_p in EVAL_PAIRS:
+    for _, _, ref_p, deg_p, _ in SCENARIOS:
         if not os.path.exists(os.path.join(data_dir, os.path.basename(ref_p))):
             needed.append(ref_p)
         if not os.path.exists(os.path.join(data_dir, os.path.basename(deg_p))):
@@ -38,11 +69,11 @@ def ensure_dataset(data_dir):
     if not needed:
         return
 
-    print("Downloading TCD-VoIP curated evaluation dataset...")
+    print("Downloading TCD-VoIP evaluation dataset...")
     req = urllib.request.Request(TCD_ZIP_URL, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req) as resp:
         zf = zipfile.ZipFile(io.BytesIO(resp.read()))
-        for _, ref_p, deg_p in EVAL_PAIRS:
+        for _, _, ref_p, deg_p, _ in SCENARIOS:
             for p in (ref_p, deg_p):
                 dest = os.path.join(data_dir, os.path.basename(p))
                 if not os.path.exists(dest):
@@ -66,6 +97,7 @@ def compute_snr(ref_wav, deg_wav):
         return 10.0 * math.log10(sig_pwr / noise_pwr)
 
 def compute_visqol(ref_wav, deg_wav):
+    """Compute ViSQOL MOS-LQO (1.0 to 5.0) in speech mode."""
     try:
         from visqol import VisqolApi
         api = VisqolApi()
@@ -74,6 +106,22 @@ def compute_visqol(ref_wav, deg_wav):
         return float(res.moslqo)
     except Exception:
         return None
+
+def write_github_summary(results, baseline_so, candidate_so):
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+
+    with open(summary_path, "a") as f:
+        f.write("\n## 🎙️ Speech Quality Evaluation: TCD-VoIP & ViSQOL\n\n")
+        f.write(f"- **Baseline Library**: `{os.path.basename(baseline_so)}`\n")
+        f.write(f"- **Candidate Library**: `{os.path.basename(candidate_so)}`\n\n")
+        f.write("| Scenario | Subsystem | Metric | Baseline | Candidate | Delta | Status |\n")
+        f.write("|:---|:---:|:---:|:---:|:---:|:---:|:---:|\n")
+        for r in results:
+            status_badge = "✅ PASS" if r["pass"] else "❌ FAIL"
+            f.write(f"| **{r['name']}** | `{r['mod']}` | {r['metric']} | {r['base']:.2f} | {r['cand']:.2f} | **{r['delta']:+.2f}** | {status_badge} |\n")
+        f.write("\n> *Quality Criterion: Candidate perceptual score (ViSQOL MOS) or SNR must equal or exceed baseline (Δ ≥ -0.05).*\n\n")
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate baseline vs candidate quality on TCD-VoIP dataset.")
@@ -85,7 +133,6 @@ def main():
 
     ensure_dataset(args.data_dir)
 
-    # Check process_wav binary
     if not os.path.exists(args.process_bin):
         print(f"Compiling {args.process_bin}...")
         res = subprocess.run(["gcc", "-std=c11", "-D_GNU_SOURCE", "-Isrc", "-O2", "tests/process_wav.c", "-ldl", "-lm", "-o", args.process_bin])
@@ -99,44 +146,64 @@ def main():
     print(f"   Candidate: {args.candidate_so}")
     print("=========================================================================================\n")
 
-    print(f"{'Condition':<20} | {'Metric':<10} | {'Baseline':<10} | {'Candidate':<10} | {'Delta':<8} | Status")
-    print("-" * 89)
+    print(f"{'Scenario':<25} | {'Metric':<10} | {'Baseline':<10} | {'Candidate':<10} | {'Delta':<8} | Status")
+    print("-" * 92)
 
     out_dir = os.path.join(args.data_dir, "output")
     os.makedirs(out_dir, exist_ok=True)
 
+    results = []
     all_passed = True
-    for label, ref_p, deg_p in EVAL_PAIRS:
+
+    for name, mod, ref_p, deg_p, desc in SCENARIOS:
         ref_file = os.path.join(args.data_dir, os.path.basename(ref_p))
         deg_file = os.path.join(args.data_dir, os.path.basename(deg_p))
 
-        base_out = os.path.join(out_dir, f"{os.path.basename(deg_p)}_base.wav")
-        cand_out = os.path.join(out_dir, f"{os.path.basename(deg_p)}_cand.wav")
+        base_out = os.path.join(out_dir, f"{os.path.basename(deg_p)}_{mod}_base.wav")
+        cand_out = os.path.join(out_dir, f"{os.path.basename(deg_p)}_{mod}_cand.wav")
 
         # Process through baseline
-        subprocess.run([args.process_bin, args.baseline_so, deg_file, base_out], check=True)
+        subprocess.run([args.process_bin, args.baseline_so, deg_file, base_out, mod], check=True)
         # Process through candidate
-        subprocess.run([args.process_bin, args.candidate_so, deg_file, cand_out], check=True)
+        subprocess.run([args.process_bin, args.candidate_so, deg_file, cand_out, mod], check=True)
 
-        # 1. ViSQOL MOS if available
+        # ViSQOL MOS or SNR
         v_base = compute_visqol(ref_file, base_out)
         v_cand = compute_visqol(ref_file, cand_out)
 
         if v_base is not None and v_cand is not None:
-            delta = v_cand - v_base
-            status = "PASS" if delta >= -0.05 else "FAIL"
-            if status == "FAIL": all_passed = False
-            print(f"{label:<20} | {'ViSQOL MOS':<10} | {v_base:<10.2f} | {v_cand:<10.2f} | {delta:<+8.2f} | {status}")
+            metric_name = "ViSQOL MOS"
+            base_val = v_base
+            cand_val = v_cand
+            delta = cand_val - base_val
+            passed = delta >= -0.05
         else:
-            # Fallback to Objective SNR
-            snr_base = compute_snr(ref_file, base_out)
-            snr_cand = compute_snr(ref_file, cand_out)
-            delta = snr_cand - snr_base
-            status = "PASS" if delta >= -0.5 else "FAIL"
-            if status == "FAIL": all_passed = False
-            print(f"{label:<20} | {'SNR (dB)':<10} | {snr_base:<10.1f} | {snr_cand:<10.1f} | {delta:<+8.1f} | {status}")
+            metric_name = "SNR (dB)"
+            base_val = compute_snr(ref_file, base_out)
+            cand_val = compute_snr(ref_file, cand_out)
+            delta = cand_val - base_val
+            passed = delta >= -0.5
 
-    print("\nQuality Evaluation Summary: " + ("ALL TESTS PASSED" if all_passed else "QUALITY REGRESSION DETECTED"))
+        if not passed:
+            all_passed = False
+
+        status_str = "PASS" if passed else "FAIL"
+        print(f"{name:<25} | {metric_name:<10} | {base_val:<10.2f} | {cand_val:<10.2f} | {delta:<+8.2f} | {status_str}")
+
+        results.append({
+            "name": name,
+            "mod": mod,
+            "metric": metric_name,
+            "base": base_val,
+            "cand": cand_val,
+            "delta": delta,
+            "pass": passed
+        })
+
+    print("-" * 92)
+    print("Quality Evaluation Summary: " + ("ALL TESTS PASSED" if all_passed else "QUALITY REGRESSION DETECTED"))
+
+    write_github_summary(results, args.baseline_so, args.candidate_so)
     sys.exit(0 if all_passed else 1)
 
 if __name__ == "__main__":

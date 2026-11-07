@@ -21,12 +21,13 @@ jobs:
           ref: ${{ github.base_ref || 'main' }}
           path: baseline
 
-      - name: Install toolchains & QEMU
+      - name: Install toolchains, QEMU & Python tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y gcc-mipsel-linux-gnu binutils-mipsel-linux-gnu \
                                   gcc-riscv64-linux-gnu libc6-dev-riscv64-cross \
-                                  qemu-user qemu-user-static
+                                  qemu-user qemu-user-static python3-pip
+          pip3 install --break-system-packages visqol-python soundfile scipy numpy || true
 
       - name: Run Unit Tests with Guard Rails (x86_64)
         run: |
@@ -47,14 +48,14 @@ jobs:
           make CROSS_COMPILE=mipsel-linux-gnu- size
           cp libaudioProcess.so ../libaudioProcess_candidate_mips.so
 
-      - name: Run MIPS Baseline vs Candidate Library Evaluation (QEMU)
+      - name: Run MIPS Baseline vs Candidate Throughput Benchmark (QEMU)
         run: |
           cd candidate
           mipsel-linux-gnu-gcc -std=c11 -D_GNU_SOURCE -Isrc -O2 tests/bench_and_test.c -ldl -lm -o tests/bench_mips
           qemu-mipsel -L /usr/mipsel-linux-gnu ./tests/bench_mips ../libaudioProcess_baseline_mips.so ../libaudioProcess_candidate_mips.so
 
-      - name: Run TCD-VoIP Speech Quality Evaluation (Baseline vs Candidate)
+      - name: Run TCD-VoIP & ViSQOL Quality Evaluation (Baseline vs Candidate)
         run: |
           cd candidate
           make process_wav
-          python3 scripts/eval_quality_tcd.py ../libaudioProcess_baseline_mips.so ../libaudioProcess_candidate_mips.so || true
+          python3 scripts/eval_quality_tcd.py ../libaudioProcess_baseline_mips.so ../libaudioProcess_candidate_mips.so

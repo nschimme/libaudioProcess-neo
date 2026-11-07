@@ -103,4 +103,10 @@ test:
 bench:
 	gcc -std=c11 -D_GNU_SOURCE -Isrc -O2 tests/bench_and_test.c -ldl -lm -o tests/bench_bin
 
-.PHONY: all clean size test bench
+process_wav:
+	gcc -std=c11 -D_GNU_SOURCE -Isrc -O2 tests/process_wav.c -ldl -lm -o tests/process_wav_bin
+
+eval-quality: process_wav
+	python3 scripts/eval_quality_tcd.py $(BASELINE) $(CANDIDATE)
+
+.PHONY: all clean size test bench process_wav eval-quality

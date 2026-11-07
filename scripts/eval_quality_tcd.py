@@ -97,14 +97,40 @@ def compute_snr(ref_wav, deg_wav):
         return 10.0 * math.log10(sig_pwr / noise_pwr)
 
 def compute_visqol(ref_wav, deg_wav):
-    """Compute ViSQOL MOS-LQO (1.0 to 5.0) in speech mode."""
+    """Compute ViSQOL MOS-LQO (1.0 to 5.0) in speech mode with automatic 16kHz resampling."""
     try:
+        import soundfile as sf
+        import scipy.signal as sps
         from visqol import VisqolApi
+
+        # ViSQOL speech lattice mode expects 16kHz audio
+        x, sr_x = sf.read(ref_wav)
+        y, sr_y = sf.read(deg_wav)
+
+        ref_path = ref_wav
+        deg_path = deg_wav
+
+        if sr_x != 16000:
+            x_16k = sps.resample(x, int(len(x) * 16000 / sr_x))
+            ref_path = f"{ref_wav}_16k.wav"
+            sf.write(ref_path, x_16k, 16000)
+
+        if sr_y != 16000:
+            y_16k = sps.resample(y, int(len(y) * 16000 / sr_y))
+            deg_path = f"{deg_wav}_16k.wav"
+            sf.write(deg_path, y_16k, 16000)
+
         api = VisqolApi()
         api.create(mode="speech")
-        res = api.measure(ref_wav, deg_wav)
+        res = api.measure(ref_path, deg_path)
+
+        if ref_path != ref_wav and os.path.exists(ref_path):
+            os.remove(ref_path)
+        if deg_path != deg_wav and os.path.exists(deg_path):
+            os.remove(deg_path)
+
         return float(res.moslqo)
-    except Exception:
+    except Exception as e:
         return None
 
 def write_github_summary(results, baseline_so, candidate_so):

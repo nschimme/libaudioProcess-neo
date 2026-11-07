@@ -96,7 +96,7 @@ size: $(TARGET)
 	@nm -D --defined-only $(TARGET) | grep -c ' T '
 
 test:
-	gcc -std=c11 -D_GNU_SOURCE -O2 -Isrc src/biquad.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/webrtc/common_audio/fft4g.c src/webrtc/common_audio/signal_processing/copy_set_operations.c tests/unit_tests.c -lm -o tests/unit_tests_bin
+	gcc -std=c11 -D_GNU_SOURCE -O2 -Isrc src/biquad.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/webrtc/common_audio/fft4g.c src/webrtc/common_audio/signal_processing/copy_set_operations.c tests/unit_tests.c -ldl -lm -o tests/unit_tests_bin
 	./tests/unit_tests_bin
 	rm -f tests/unit_tests_bin
 

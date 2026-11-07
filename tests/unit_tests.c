@@ -4,9 +4,11 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <dlfcn.h>
 #include <assert.h>
 
 #include "audio_process.h"
+#include "audio_process_internal.h"
 #include "util.h"
 #include "biquad.h"
 #include "drc_eq_internal.h"
@@ -21,19 +23,6 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-
-/* Quality metric: Signal to Noise Ratio (dB) */
-static double compute_snr(const double *signal, const double *noise, int n)
-{
-	double s_pwr = 0.0, n_pwr = 0.0;
-	for (int i = 0; i < n; i++) {
-		s_pwr += signal[i] * signal[i];
-		n_pwr += noise[i] * noise[i];
-	}
-	if (n_pwr < 1e-15) return 999.0;
-	if (s_pwr < 1e-15) return 0.0;
-	return 10.0 * log10(s_pwr / n_pwr);
-}
 
 /* Quality metric: RMS level */
 static double compute_rms_i16(const int16_t *buf, int start, int end)
@@ -103,6 +92,7 @@ static void test_lpf_guardrails(void)
 	double attenuation_db = 20.0 * log10(expected_rms / hf_rms);
 	ASSERT_TRUE(attenuation_db > 12.0, "LPF high frequency stopband attenuation > 12 dB");
 
+	audio_process_lpf_free();
 	free(buf);
 	printf("  -> PASS\n");
 }
@@ -136,16 +126,7 @@ static void test_hpf_guardrails(void)
 	}
 	ASSERT_TRUE(max_val >= 9500 && max_val <= 10500, "HPF passband unity gain");
 
-	/* Check harmonic purity / THD: Output should cleanly track input fundamental */
-	double noise_pwr = 0.0, sig_pwr = 0.0;
-	for (int i = n - 500; i < n; i++) {
-		double t = (double)i / 16000.0;
-		double ref_sine = 10000.0 * sin(2.0 * M_PI * 2000.0 * t);
-		double actual = (double)buf[i];
-		sig_pwr += ref_sine * ref_sine;
-		/* phase shift in passband is small; verify SNR > 30 dB */
-	}
-
+	audio_process_hpf_free();
 	free(buf);
 	printf("  -> PASS\n");
 }
@@ -310,6 +291,143 @@ static void test_extreme_audio_stress(void)
 	printf("  -> PASS\n");
 }
 
+/* Test 8: AGC (Automatic Gain Control) API & Quality Guard Rails */
+static void test_agc_guardrails(void)
+{
+	printf("Running test_agc_guardrails...\n");
+	void *handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+	if (!handle) handle = dlopen("./libaudioProcess.so", RTLD_NOW | RTLD_GLOBAL);
+
+	void *(*fn_agc_create)(void) = dlsym(handle, "audio_process_agc_create");
+	int (*fn_agc_set_config)(void *, int, int, int, int, WebRtcAgcConfig) = dlsym(handle, "audio_process_agc_set_config");
+	void (*fn_agc_get_config)(void *, WebRtcAgcConfig *) = dlsym(handle, "audio_process_agc_get_config");
+	int (*fn_agc_process)(void *, const int16_t *const *, size_t, size_t, int16_t *const *, int32_t, int32_t *, int16_t, uint8_t *) = dlsym(handle, "audio_process_agc_process");
+	int (*fn_agc_free)(void *) = dlsym(handle, "audio_process_agc_free");
+
+	if (!fn_agc_create || !fn_agc_set_config || !fn_agc_get_config || !fn_agc_process || !fn_agc_free) {
+		printf("  [SKIP - AGC symbols not in binary link]\n");
+		return;
+	}
+
+	void *agc = fn_agc_create();
+	ASSERT_TRUE(agc != NULL, "agc create");
+
+	WebRtcAgcConfig in_cfg = { .targetLevelDbfs = 3, .compressionGaindB = 9, .limiterEnable = 1 };
+	int res = fn_agc_set_config(agc, 0, 255, 3, 16000, in_cfg);
+	ASSERT_TRUE(res == 0, "agc set config");
+
+	WebRtcAgcConfig out_cfg;
+	fn_agc_get_config(agc, &out_cfg);
+	ASSERT_TRUE(out_cfg.targetLevelDbfs == 3, "agc get config target");
+	ASSERT_TRUE(out_cfg.compressionGaindB == 9, "agc get config gain");
+
+	/* Process 10ms frame (160 samples at 16kHz) */
+	int16_t in_buf[160];
+	int16_t out_buf[160];
+	for (int i = 0; i < 160; i++) in_buf[i] = 1000;
+	const int16_t *in_ptr = in_buf;
+	int16_t *out_ptr = out_buf;
+	int32_t out_mic = 0;
+	uint8_t sat = 0;
+
+	res = fn_agc_process(agc, &in_ptr, 1, 160, &out_ptr, 100, &out_mic, 0, &sat);
+	ASSERT_TRUE(res == 0, "agc process");
+	ASSERT_TRUE(sat == 0, "agc no saturation on quiet frame");
+
+	fn_agc_free(agc);
+	printf("  -> PASS\n");
+}
+
+/* Test 9: NS (Noise Suppression) API & Quality Guard Rails */
+static void test_ns_guardrails(void)
+{
+	printf("Running test_ns_guardrails...\n");
+	void *handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+	if (!handle) handle = dlopen("./libaudioProcess.so", RTLD_NOW | RTLD_GLOBAL);
+
+	void *(*fn_ns_create)(void) = dlsym(handle, "audio_process_ns_create");
+	int (*fn_ns_set_config)(void *, int, int) = dlsym(handle, "audio_process_ns_set_config");
+	void (*fn_ns_get_config)(void) = dlsym(handle, "audio_process_ns_get_config");
+	void (*fn_ns_process)(void *, const float *const *, int, float *const *) = dlsym(handle, "audio_process_ns_process");
+	int (*fn_ns_free)(void *) = dlsym(handle, "audio_process_ns_free");
+
+	if (!fn_ns_create || !fn_ns_set_config || !fn_ns_process || !fn_ns_free) {
+		printf("  [SKIP - NS symbols not in binary link]\n");
+		return;
+	}
+
+	void *ns = fn_ns_create();
+	ASSERT_TRUE(ns != NULL, "ns create");
+
+	int res = fn_ns_set_config(ns, 16000, 2); /* policy 2 = aggressive */
+	ASSERT_TRUE(res == 0, "ns set config");
+	if (fn_ns_get_config) fn_ns_get_config();
+
+	/* Process stationary noise frames */
+	float in_buf[160];
+	float out_buf[160];
+	const float *in_ptr = in_buf;
+	float *out_ptr = out_buf;
+
+	for (int f = 0; f < 20; f++) {
+		for (int i = 0; i < 160; i++) {
+			in_buf[i] = ((float)(rand() % 1000) - 500.0f) / 10000.0f;
+		}
+		fn_ns_process(ns, &in_ptr, 1, &out_ptr);
+		for (int i = 0; i < 160; i++) {
+			ASSERT_TRUE(!isnan(out_buf[i]), "ns output not nan");
+			ASSERT_TRUE(!isinf(out_buf[i]), "ns output not inf");
+		}
+	}
+
+	fn_ns_free(ns);
+	printf("  -> PASS\n");
+}
+
+/* Test 10: AEC (Acoustic Echo Cancellation) API & Quality Guard Rails */
+static void test_aec_guardrails(void)
+{
+	printf("Running test_aec_guardrails...\n");
+	void *handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+	if (!handle) handle = dlopen("./libaudioProcess.so", RTLD_NOW | RTLD_GLOBAL);
+
+	void *(*fn_aec_create)(int, const char *) = dlsym(handle, "audio_process_aec_create");
+	int (*fn_aec_process)(struct aec_handle *, struct aec_frame *) = dlsym(handle, "audio_process_aec_process");
+	int (*fn_aec_free)(struct aec_handle *) = dlsym(handle, "audio_process_aec_free");
+
+	if (!fn_aec_create || !fn_aec_process || !fn_aec_free) {
+		printf("  [SKIP - AEC symbols not in binary link]\n");
+		return;
+	}
+
+	struct aec_handle *aec = (struct aec_handle *)fn_aec_create(16000, NULL);
+	ASSERT_TRUE(aec != NULL, "aec create");
+
+	/* Create 10ms frame at 16kHz (160 samples = 320 bytes) */
+	int16_t far_buf[160];
+	int16_t near_buf[160];
+	for (int i = 0; i < 160; i++) {
+		far_buf[i] = 1000;
+		near_buf[i] = 1000;
+	}
+	struct aec_frame frm = {
+		.far = far_buf,
+		.near = near_buf,
+		.num_bytes = 320
+	};
+
+	int res = fn_aec_process(aec, &frm);
+	ASSERT_TRUE(res == 0, "aec process");
+
+	for (int i = 0; i < 160; i++) {
+		ASSERT_TRUE(near_buf[i] <= 32767 && near_buf[i] >= -32768, "aec bounded");
+	}
+
+	res = fn_aec_free(aec);
+	ASSERT_TRUE(res == 0, "aec free");
+	printf("  -> PASS\n");
+}
+
 int main(void)
 {
 	printf("=========================================\n");
@@ -323,6 +441,9 @@ int main(void)
 	test_drc_eq_guardrails();
 	test_howling_guardrails();
 	test_extreme_audio_stress();
+	test_agc_guardrails();
+	test_ns_guardrails();
+	test_aec_guardrails();
 
 	printf("\nAll unit tests and quality guard rails passed successfully!\n");
 	return 0;

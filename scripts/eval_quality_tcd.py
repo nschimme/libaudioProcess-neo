@@ -288,8 +288,11 @@ def main():
             sf.write(in_wav, deg_sr, sr)
             sf.write(ref_wav, ref_sr, sr)
 
-            subprocess.run(runner_cmd + [args.process_bin, args.baseline_so, in_wav, base_out, mod], check=True)
-            subprocess.run(runner_cmd + [args.process_bin, args.candidate_so, in_wav, cand_out, mod], check=True)
+            # Pass clean reference audio as far-end loudspeaker reference for AEC/Echo scenarios
+            far_arg = [ref_wav] if ("Echo" in cond or mod in ["aec", "all"]) else []
+
+            subprocess.run(runner_cmd + [args.process_bin, args.baseline_so, in_wav, base_out, mod] + far_arg, check=True)
+            subprocess.run(runner_cmd + [args.process_bin, args.candidate_so, in_wav, cand_out, mod] + far_arg, check=True)
 
             base_mos, backend = compute_mos(ref_wav, base_out, sr, visqol_api)
             cand_mos, _ = compute_mos(ref_wav, cand_out, sr, visqol_api)

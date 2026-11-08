@@ -50,7 +50,7 @@ typedef int   (*fn_aec_free)(struct aec_handle *);
 int main(int argc, char **argv)
 {
 	if (argc < 4) {
-		fprintf(stderr, "Usage: %s <libaudioProcess.so> <input.wav> <output.wav> [module: all|hpf|lpf|drc|agc|ns|aec]\n", argv[0]);
+		fprintf(stderr, "Usage: %s <libaudioProcess.so> <input.wav> <output.wav> [module: all|hpf|lpf|drc|agc|ns|aec] [far_ref.wav]\n", argv[0]);
 		return 1;
 	}
 
@@ -58,6 +58,7 @@ int main(int argc, char **argv)
 	const char *in_path = argv[2];
 	const char *out_path = argv[3];
 	const char *mod = (argc > 4) ? argv[4] : "all";
+	const char *far_path = (argc > 5) ? argv[5] : NULL;
 
 	/* Pre-load libm with RTLD_GLOBAL to resolve math symbols on libraries
 	   built with --as-needed */
@@ -67,6 +68,27 @@ int main(int argc, char **argv)
 	if (!handle) {
 		fprintf(stderr, "Failed to load %s: %s\n", lib_path, dlerror());
 		return 1;
+	}
+
+	/* Optional far-end reference audio for dual-channel AEC evaluation */
+	int16_t *far_samples = NULL;
+	int far_num_samples = 0;
+	if (far_path && strlen(far_path) > 0) {
+		FILE *ffar = fopen(far_path, "rb");
+		if (ffar) {
+			struct wav_header far_hdr;
+			if (fread(&far_hdr, 1, sizeof(far_hdr), ffar) == sizeof(far_hdr) &&
+			    far_hdr.bits_per_sample == 16 && far_hdr.num_channels == 1) {
+				far_num_samples = far_hdr.data_size / sizeof(int16_t);
+				far_samples = malloc(far_num_samples * sizeof(int16_t));
+				if (fread(far_samples, sizeof(int16_t), far_num_samples, ffar) != (size_t)far_num_samples) {
+					free(far_samples);
+					far_samples = NULL;
+					far_num_samples = 0;
+				}
+			}
+			fclose(ffar);
+		}
 	}
 
 	FILE *fin = fopen(in_path, "rb");
@@ -180,6 +202,44 @@ int main(int argc, char **argv)
 			drc_proc(drc, samples, num_samples);
 			drc_free(drc);
 		}
+	}
+
+	/* 5. AEC: executed when mod is "aec", or when running pipeline with a valid far-end reference */
+	if (strcmp(mod, "aec") == 0 || (run_all && far_samples != NULL)) {
+		fn_aec_create aec_create = dlsym(handle, "audio_process_aec_create");
+		fn_aec_process aec_proc = dlsym(handle, "audio_process_aec_process");
+		fn_aec_free aec_free = dlsym(handle, "audio_process_aec_free");
+		if (aec_create && aec_proc && aec_free) {
+			struct aec_handle *aec = aec_create(sample_rate, NULL);
+			if (aec) {
+				int frame_size = sample_rate / 100; /* 10ms */
+				int num_frames = num_samples / frame_size;
+				int16_t *far_frame = malloc(frame_size * sizeof(int16_t));
+
+				for (int f = 0; f < num_frames; f++) {
+					int16_t *near_chunk = samples + f * frame_size;
+					if (far_samples && (f + 1) * frame_size <= far_num_samples) {
+						memcpy(far_frame, far_samples + f * frame_size, frame_size * sizeof(int16_t));
+					} else {
+						memset(far_frame, 0, frame_size * sizeof(int16_t));
+					}
+
+					struct aec_frame frm = {
+						.far = far_frame,
+						.near = near_chunk,
+						.num_bytes = frame_size * sizeof(int16_t)
+					};
+					aec_proc(aec, &frm);
+				}
+
+				free(far_frame);
+				aec_free(aec);
+			}
+		}
+	}
+
+	if (far_samples) {
+		free(far_samples);
 	}
 
 	/* Write output WAV */

@@ -98,7 +98,7 @@ test:
 	rm -f tests/unit_tests_bin
 
 bench:
-	gcc -std=c11 -D_GNU_SOURCE -Isrc -O2 tests/bench_and_test.c -ldl -lm -o tests/bench_bin
+	gcc -std=c11 -D_GNU_SOURCE -rdynamic -Isrc -O2 tests/bench_and_test.c -ldl -lm -o tests/bench_bin
 
 process_wav:
 	gcc -std=c11 -D_GNU_SOURCE -Isrc -O2 tests/process_wav.c -ldl -lm -o tests/process_wav_bin

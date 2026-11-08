@@ -92,12 +92,10 @@ static inline int16_t soft_limiter_fast(int32_t val)
 {
 	const int32_t thr = 27000;
 	if (val > thr) {
-		int32_t diff = val - thr;
-		val = thr + (diff >> 2);
+		val = thr + ((val - thr) >> 2);
 		if (val > 32767) val = 32767;
 	} else if (val < -thr) {
-		int32_t diff = -val - thr;
-		val = -(thr + (diff >> 2));
+		val = -(thr + ((-val - thr) >> 2));
 		if (val < -32768) val = -32768;
 	}
 	return (int16_t)val;
@@ -122,8 +120,8 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 	const int16_t *__restrict__ in = in_near[0];
 	int16_t *__restrict__ out_buf = out[0];
 
-	/* Fast 4x unrolled integer energy and peak estimation */
-	int64_t sum_sq = 0;
+	/* 32-bit integer energy and peak estimation (avoid 64-bit emulation on 32-bit MIPS) */
+	int32_t sum_sq_scaled = 0;
 	int16_t frame_peak = 0;
 	size_t i = 0;
 	for (; i + 3 < samples; i += 4) {
@@ -131,7 +129,12 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 		int32_t s1 = in[i + 1];
 		int32_t s2 = in[i + 2];
 		int32_t s3 = in[i + 3];
-		sum_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+
+		int32_t s0_sc = s0 >> 3;
+		int32_t s1_sc = s1 >> 3;
+		int32_t s2_sc = s2 >> 3;
+		int32_t s3_sc = s3 >> 3;
+		sum_sq_scaled += s0_sc * s0_sc + s1_sc * s1_sc + s2_sc * s2_sc + s3_sc * s3_sc;
 
 		int16_t a0 = (s0 >= 0) ? (int16_t)s0 : (int16_t)(-s0);
 		int16_t a1 = (s1 >= 0) ? (int16_t)s1 : (int16_t)(-s1);
@@ -144,12 +147,13 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 	}
 	for (; i < samples; i++) {
 		int32_t s = in[i];
-		sum_sq += s * s;
+		int32_t s_sc = s >> 3;
+		sum_sq_scaled += s_sc * s_sc;
 		int16_t abs_s = (s >= 0) ? (int16_t)s : (int16_t)(-s);
 		if (abs_s > frame_peak) frame_peak = abs_s;
 	}
 
-	float frame_rms = sqrtf((float)sum_sq / (float)samples);
+	float frame_rms = sqrtf((float)sum_sq_scaled / (float)samples) * 8.0f;
 
 	/* Dual envelope update (attack 10ms, release 300ms) */
 	float alpha_rms = (frame_rms > st->energy_env) ? 0.35f : 0.035f;
@@ -184,32 +188,51 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 	float end_gain = start_gain + alpha_gain * (desired_gain - start_gain);
 	st->current_gain = end_gain;
 
-	/* Fixed-point Q16 gain interpolation */
-	int32_t g_q16 = (int32_t)(start_gain * 65536.0f);
-	int32_t end_g_q16 = (int32_t)(end_gain * 65536.0f);
-	int32_t step_q16 = (end_g_q16 - g_q16) / (int32_t)samples;
+	/* Fixed-point Q12 gain interpolation (32-bit math for single-cycle MIPS multiply) */
+	int32_t g_q12 = (int32_t)(start_gain * 4096.0f);
+	int32_t end_g_q12 = (int32_t)(end_gain * 4096.0f);
+	int32_t step_q12 = (end_g_q12 - g_q12) / (int32_t)samples;
 
 	int limiter_on = st->config.limiterEnable;
 	uint8_t saturated = 0;
 
-	if (limiter_on) {
+	const int16_t *__restrict__ p_in = in;
+	int16_t *__restrict__ p_out = out_buf;
+
+	/* Fast-path: check if maximum possible output stays well within linear range */
+	int32_t max_out = ((int32_t)frame_peak * AGC_MAX(g_q12, end_g_q12)) >> 12;
+	if (limiter_on && max_out < 27000) {
 		i = 0;
 		for (; i + 3 < samples; i += 4) {
-			g_q16 += step_q16;
-			int32_t y0 = (int32_t)(((int64_t)in[i] * g_q16) >> 16);
-			out_buf[i] = soft_limiter_fast(y0);
+			g_q12 += step_q12;
+			*p_out++ = (int16_t)(((int32_t)*p_in++ * g_q12) >> 12);
+			g_q12 += step_q12;
+			*p_out++ = (int16_t)(((int32_t)*p_in++ * g_q12) >> 12);
+			g_q12 += step_q12;
+			*p_out++ = (int16_t)(((int32_t)*p_in++ * g_q12) >> 12);
+			g_q12 += step_q12;
+			*p_out++ = (int16_t)(((int32_t)*p_in++ * g_q12) >> 12);
+		}
+		for (; i < samples; i++) {
+			g_q12 += step_q12;
+			*p_out++ = (int16_t)(((int32_t)*p_in++ * g_q12) >> 12);
+		}
+	} else if (limiter_on) {
+		i = 0;
+		for (; i + 3 < samples; i += 4) {
+			g_q12 += step_q12;
+			int32_t y0 = ((int32_t)*p_in++ * g_q12) >> 12;
+			g_q12 += step_q12;
+			int32_t y1 = ((int32_t)*p_in++ * g_q12) >> 12;
+			g_q12 += step_q12;
+			int32_t y2 = ((int32_t)*p_in++ * g_q12) >> 12;
+			g_q12 += step_q12;
+			int32_t y3 = ((int32_t)*p_in++ * g_q12) >> 12;
 
-			g_q16 += step_q16;
-			int32_t y1 = (int32_t)(((int64_t)in[i + 1] * g_q16) >> 16);
-			out_buf[i + 1] = soft_limiter_fast(y1);
-
-			g_q16 += step_q16;
-			int32_t y2 = (int32_t)(((int64_t)in[i + 2] * g_q16) >> 16);
-			out_buf[i + 2] = soft_limiter_fast(y2);
-
-			g_q16 += step_q16;
-			int32_t y3 = (int32_t)(((int64_t)in[i + 3] * g_q16) >> 16);
-			out_buf[i + 3] = soft_limiter_fast(y3);
+			*p_out++ = soft_limiter_fast(y0);
+			*p_out++ = soft_limiter_fast(y1);
+			*p_out++ = soft_limiter_fast(y2);
+			*p_out++ = soft_limiter_fast(y3);
 
 			if (y0 > 32000 || y0 < -32000 || y1 > 32000 || y1 < -32000 ||
 			    y2 > 32000 || y2 < -32000 || y3 > 32000 || y3 < -32000) {
@@ -217,30 +240,28 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 			}
 		}
 		for (; i < samples; i++) {
-			g_q16 += step_q16;
-			int32_t y = (int32_t)(((int64_t)in[i] * g_q16) >> 16);
+			g_q12 += step_q12;
+			int32_t y = ((int32_t)*p_in++ * g_q12) >> 12;
 			if (y > 32000 || y < -32000)
 				saturated = 1;
-			out_buf[i] = soft_limiter_fast(y);
+			*p_out++ = soft_limiter_fast(y);
 		}
 	} else {
 		i = 0;
 		for (; i + 3 < samples; i += 4) {
-			g_q16 += step_q16;
-			int32_t y0 = (int32_t)(((int64_t)in[i] * g_q16) >> 16);
-			out_buf[i] = clamp_i16(y0);
+			g_q12 += step_q12;
+			int32_t y0 = ((int32_t)*p_in++ * g_q12) >> 12;
+			g_q12 += step_q12;
+			int32_t y1 = ((int32_t)*p_in++ * g_q12) >> 12;
+			g_q12 += step_q12;
+			int32_t y2 = ((int32_t)*p_in++ * g_q12) >> 12;
+			g_q12 += step_q12;
+			int32_t y3 = ((int32_t)*p_in++ * g_q12) >> 12;
 
-			g_q16 += step_q16;
-			int32_t y1 = (int32_t)(((int64_t)in[i + 1] * g_q16) >> 16);
-			out_buf[i + 1] = clamp_i16(y1);
-
-			g_q16 += step_q16;
-			int32_t y2 = (int32_t)(((int64_t)in[i + 2] * g_q16) >> 16);
-			out_buf[i + 2] = clamp_i16(y2);
-
-			g_q16 += step_q16;
-			int32_t y3 = (int32_t)(((int64_t)in[i + 3] * g_q16) >> 16);
-			out_buf[i + 3] = clamp_i16(y3);
+			*p_out++ = clamp_i16(y0);
+			*p_out++ = clamp_i16(y1);
+			*p_out++ = clamp_i16(y2);
+			*p_out++ = clamp_i16(y3);
 
 			if (y0 > 32767 || y0 < -32768 || y1 > 32767 || y1 < -32768 ||
 			    y2 > 32767 || y2 < -32768 || y3 > 32767 || y3 < -32768) {
@@ -248,11 +269,11 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 			}
 		}
 		for (; i < samples; i++) {
-			g_q16 += step_q16;
-			int32_t y = (int32_t)(((int64_t)in[i] * g_q16) >> 16);
+			g_q12 += step_q12;
+			int32_t y = ((int32_t)*p_in++ * g_q12) >> 12;
 			if (y > 32767 || y < -32768)
 				saturated = 1;
-			out_buf[i] = clamp_i16(y);
+			*p_out++ = clamp_i16(y);
 		}
 	}
 
@@ -260,11 +281,11 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 	for (size_t b = 1; b < num_bands; b++) {
 		const int16_t *__restrict__ in_b = in_near[b];
 		int16_t *__restrict__ out_b = out[b];
-		int32_t gb_q16 = (int32_t)(start_gain * 65536.0f);
+		int32_t gb_q12 = (int32_t)(start_gain * 4096.0f);
 		for (size_t j = 0; j < samples; j++) {
-			gb_q16 += step_q16;
-			int32_t y = (int32_t)(((int64_t)in_b[j] * gb_q16) >> 16);
-			out_b[j] = clamp_i16(y);
+			gb_q12 += step_q12;
+			int32_t y = ((int32_t)*in_b++ * gb_q12) >> 12;
+			*out_b++ = clamp_i16(y);
 		}
 	}
 

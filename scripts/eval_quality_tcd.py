@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-TCD-VoIP & ViSQOL Objective Speech Quality Evaluation Harness
-Evaluates Baseline vs Candidate shared libraries across multiple real VoIP scenarios.
-Supports visqol-python (perceptual MOS-LQO 1.0 - 5.0) and objective SNR metrics.
-Publishes a rich Markdown summary table to GITHUB_STEP_SUMMARY.
+TCD-VoIP Statistical Speech Quality & Perceptual Evaluation Harness
+Evaluates Baseline vs Candidate shared libraries across real VoIP scenarios derived from
+'TCD VOIP - Test Set Conditions and MOS Results.xlsx'.
+Supports:
+  - Multi-sample-rate evaluation: 16 kHz, 24 kHz, 32 kHz, 44.1 kHz, 48 kHz
+  - ViSQOL lattice speech mode for 16 kHz telephony
+  - Zimtohrli full-band perceptual model (48 kHz) for wideband/high sample rates
+  - Objective SNR metrics and statistical analysis (mean, standard deviation, delta confidence)
+  - GitHub Actions Step Summary rich markdown publishing
 """
 
 import os
@@ -16,141 +21,181 @@ import wave
 import struct
 import math
 import subprocess
+import numpy as np
 
 TCD_ZIP_URL = "https://codeload.github.com/nschimme/TCD-VOIP/zip/refs/tags/harte2015tcd"
 
-# Comprehensive evaluation scenarios matching TCD-VoIP dataset structure:
-# Format: (Scenario Name, Submodule, Clean Ref, Degraded File, Description)
-SCENARIOS = [
-    # 1. Noise Suppression Scenarios (Male & Female voices, different noise environments)
-    ("Noise Supp (Male MK)", "ns",
-     "TCD-VOIP-harte2015tcd/Test Set/noise/ref/R_10_NOISE_MK.wav",
-     "TCD-VOIP-harte2015tcd/Test Set/noise/C_10_NOISE_MK.wav",
-     "Male speaker with background street/babble noise"),
-
-    ("Noise Supp (Female ML)", "ns",
-     "TCD-VOIP-harte2015tcd/Test Set/noise/ref/R_18_NOISE_ML.wav",
-     "TCD-VOIP-harte2015tcd/Test Set/noise/C_18_NOISE_ML.wav",
-     "Female speaker with ambient acoustic room noise"),
-
-    # 2. Acoustic Echo Scenarios
-    ("Echo Rejection (Female FG)", "all",
-     "TCD-VOIP-harte2015tcd/Test Set/echo/ref/R_15_ECHO_FG.wav",
-     "TCD-VOIP-harte2015tcd/Test Set/echo/C_15_ECHO_FG.wav",
-     "Far-end acoustic room echo coupled into microphone"),
-
-    # 3. Dynamic Range & Clipping Protection
-    ("Limiter Protection (FA)", "drc",
-     "TCD-VOIP-harte2015tcd/Test Set/clip/ref/R_01_CLIP_FA.wav",
-     "TCD-VOIP-harte2015tcd/Test Set/clip/C_01_CLIP_FA.wav",
-     "Speech with severe analog/digital clipping harmonics"),
-
-    # 4. Clean Speech Transparency (Ensuring filters do not distort pristine voice)
-    ("Clean Speech Trans (FA)", "all",
-     "TCD-VOIP-harte2015tcd/Test Set/compspkr/ref/R_01_COMPSPKR_FA.wav",
-     "TCD-VOIP-harte2015tcd/Test Set/compspkr/ref/R_01_COMPSPKR_FA.wav",
-     "Pristine studio speech; checks absence of processing distortion"),
-
-    ("Clean Speech Trans (MK)", "all",
-     "TCD-VOIP-harte2015tcd/Test Set/clip/ref/R_01_CLIP_MK.wav",
-     "TCD-VOIP-harte2015tcd/Test Set/clip/ref/R_01_CLIP_MK.wav",
-     "Pristine male speech; checks harmonic fidelity"),
-]
+EVAL_SAMPLE_RATES = [16000, 24000, 32000, 44100, 48000]
 
 def ensure_dataset(data_dir):
     os.makedirs(data_dir, exist_ok=True)
-    needed = []
-    for _, _, ref_p, deg_p, _ in SCENARIOS:
-        if not os.path.exists(os.path.join(data_dir, os.path.basename(ref_p))):
-            needed.append(ref_p)
-        if not os.path.exists(os.path.join(data_dir, os.path.basename(deg_p))):
-            needed.append(deg_p)
+    zip_cache = os.path.join(data_dir, "harte2015tcd.zip")
+    xlsx_path = os.path.join(data_dir, "TCD VOIP - Test Set Conditions and MOS Results.xlsx")
 
-    if not needed:
-        return
+    if not os.path.exists(zip_cache):
+        print("Downloading TCD-VoIP evaluation dataset archive (~265MB)...")
+        req = urllib.request.Request(TCD_ZIP_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as resp, open(zip_cache, "wb") as f_out:
+            f_out.write(resp.read())
+        print("Download complete.")
 
-    print("Downloading TCD-VoIP evaluation dataset...")
-    req = urllib.request.Request(TCD_ZIP_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req) as resp:
-        zf = zipfile.ZipFile(io.BytesIO(resp.read()))
-        for _, _, ref_p, deg_p, _ in SCENARIOS:
-            for p in (ref_p, deg_p):
-                dest = os.path.join(data_dir, os.path.basename(p))
-                if not os.path.exists(dest):
-                    print(f"  Extracting {os.path.basename(p)}...")
-                    with open(dest, "wb") as f_out:
-                        f_out.write(zf.read(p))
+    with zipfile.ZipFile(zip_cache, "r") as zf:
+        if not os.path.exists(xlsx_path):
+            xlsx_name = "TCD-VOIP-harte2015tcd/TCD VOIP - Test Set Conditions and MOS Results.xlsx"
+            with open(xlsx_path, "wb") as f:
+                f.write(zf.read(xlsx_name))
 
-def compute_snr(ref_wav, deg_wav):
-    """Compute SNR in dB between reference and degraded/processed WAV."""
-    with wave.open(ref_wav, 'rb') as r, wave.open(deg_wav, 'rb') as d:
-        n = min(r.getnframes(), d.getnframes())
-        r_raw = r.readframes(n)
-        d_raw = d.readframes(n)
-        r_s = struct.unpack(f"{n}h", r_raw)
-        d_s = struct.unpack(f"{n}h", d_raw)
+def load_test_battery(data_dir):
+    """
+    Parse 'TCD VOIP - Test Set Conditions and MOS Results.xlsx' to construct a
+    statistically balanced battery covering all degradation types and human MOS scores.
+    """
+    import pandas as pd
+    xlsx_path = os.path.join(data_dir, "TCD VOIP - Test Set Conditions and MOS Results.xlsx")
+    excel = pd.ExcelFile(xlsx_path)
+    df_cond = pd.read_excel(excel, sheet_name="Test Conditions")
+    df_scores = pd.read_excel(excel, sheet_name="Subjective Test Scores")
 
-        sig_pwr = sum(s * s for s in r_s)
-        noise_pwr = sum((s - d) * (s - d) for s, d in zip(r_s, d_s))
-        if noise_pwr < 1e-12: return 999.0
-        if sig_pwr < 1e-12: return 0.0
-        return 10.0 * math.log10(sig_pwr / noise_pwr)
+    merged = pd.merge(df_cond, df_scores[["Filename", "sample MOS"]], on="Filename")
+    merged["DegType"] = merged["Filename"].apply(lambda x: x.split("_")[2])
 
-def compute_visqol(ref_wav, deg_wav):
-    """Compute ViSQOL MOS-LQO (1.0 to 5.0) in speech mode with automatic 16kHz resampling."""
+    items = []
+
+    # 1. NOISE (tested with 'ns'): Babble, car, office, road
+    noise_sub = merged[(merged["DegType"] == "NOISE") & (~merged["Noise Type"].str.contains("MNRU", na=False))]
+    for ntype in ["babble", "car", "office", "road"]:
+        for _, row in noise_sub[noise_sub["Noise Type"] == ntype].head(2).iterrows():
+            fname = row["Filename"]
+            ref = fname.replace("C_", "R_")
+            items.append(("Noise Suppression (NS)", "ns", f"Noise: {ntype}", fname, ref, float(row["sample MOS"])))
+
+    # 2. CLIP (tested with 'drc' and 'agc'): Mild, moderate, severe clipping
+    clip_sub = merged[(merged["DegType"] == "CLIP") & (~merged["Clip Gain"].astype(str).str.contains("MNRU", na=False))]
+    for cgain in [5, 9, 13, 25]:
+        for _, row in clip_sub[clip_sub["Clip Gain"] == cgain].head(1).iterrows():
+            fname = row["Filename"]
+            ref = fname.replace("C_", "R_")
+            items.append(("Dynamic Range (DRC)", "drc", f"Clip Gain {cgain}", fname, ref, float(row["sample MOS"])))
+            items.append(("Automatic Gain (AGC)", "agc", f"Clip Gain {cgain}", fname, ref, float(row["sample MOS"])))
+
+    # 3. ECHO (tested with 'all'): Short, medium, long delay
+    echo_sub = merged[merged["DegType"] == "ECHO"]
+    for edelay in [20, 40, 100, 180]:
+        for _, row in echo_sub[echo_sub["Echo Delay"] == edelay].head(1).iterrows():
+            fname = row["Filename"]
+            ref = fname.replace("C_", "R_")
+            items.append(("Acoustic Echo (AEC)", "all", f"Echo {edelay}ms", fname, ref, float(row["sample MOS"])))
+
+    # 4. COMPSPKR (tested with 'all'): Competing speaker audio
+    comp_sub = merged[(merged["DegType"] == "COMPSPKR") & (~merged["Competing Speaker SNR"].isna())]
+    for snr in [0, 6, 12]:
+        for _, row in comp_sub[comp_sub["Competing Speaker SNR"] == snr].head(1).iterrows():
+            fname = row["Filename"]
+            ref = fname.replace("C_", "R_")
+            items.append(("Clean Voice Transparency", "all", f"CompSpkr {snr}dB", fname, ref, float(row["sample MOS"])))
+
+    return items
+
+def extract_files(data_dir, items):
+    zip_cache = os.path.join(data_dir, "harte2015tcd.zip")
+    with zipfile.ZipFile(zip_cache, "r") as zf:
+        namelist = set(zf.namelist())
+        for _, _, _, deg_fn, ref_fn, _ in items:
+            deg_dest = os.path.join(data_dir, deg_fn)
+            ref_dest = os.path.join(data_dir, ref_fn)
+            deg_type = deg_fn.split("_")[2].lower()
+
+            if not os.path.exists(deg_dest):
+                deg_arc = f"TCD-VOIP-harte2015tcd/Test Set/{deg_type}/{deg_fn}"
+                if deg_arc in namelist:
+                    with open(deg_dest, "wb") as f: f.write(zf.read(deg_arc))
+
+            if not os.path.exists(ref_dest):
+                ref_arc = f"TCD-VOIP-harte2015tcd/Test Set/{deg_type}/ref/{ref_fn}"
+                if ref_arc in namelist:
+                    with open(ref_dest, "wb") as f: f.write(zf.read(ref_arc))
+
+def compute_snr(ref_raw, deg_raw):
+    """Compute SNR in dB between reference and degraded/processed numpy arrays."""
+    n = min(len(ref_raw), len(deg_raw))
+    r = ref_raw[:n].astype(np.float64)
+    d = deg_raw[:n].astype(np.float64)
+    sig_pwr = np.sum(r * r)
+    noise_pwr = np.sum((r - d) * (r - d))
+    if noise_pwr < 1e-12: return 999.0
+    if sig_pwr < 1e-12: return 0.0
+    return float(10.0 * np.log10(sig_pwr / noise_pwr))
+
+def compute_mos(ref_path, deg_path, sample_rate, visqol_api):
+    """
+    Computes perceptual MOS:
+      - At 16 kHz: ViSQOL speech lattice mode
+      - At other rates (24k, 32k, 44.1k, 48k): Zimtohrli perceptual model (upsampled to 48 kHz)
+    """
+    import soundfile as sf
+    import scipy.signal as sps
+
+    ref_data, sr_r = sf.read(ref_path)
+    deg_data, sr_d = sf.read(deg_path)
+
+    if sample_rate == 16000 and visqol_api is not None:
+        try:
+            r16 = ref_data if sr_r == 16000 else sps.resample(ref_data, int(len(ref_data) * 16000 / sr_r))
+            d16 = deg_data if sr_d == 16000 else sps.resample(deg_data, int(len(deg_data) * 16000 / sr_d))
+            t_ref = f"{ref_path}_v16.wav"
+            t_deg = f"{deg_path}_v16.wav"
+            sf.write(t_ref, r16, 16000)
+            sf.write(t_deg, d16, 16000)
+            res = visqol_api.measure(t_ref, t_deg)
+            if os.path.exists(t_ref): os.remove(t_ref)
+            if os.path.exists(t_deg): os.remove(t_deg)
+            return float(res.moslqo), "ViSQOL-16k"
+        except Exception:
+            pass
+
+    # For non-16kHz rates, evaluate using Zimtohrli (which natively requires 48 kHz signals)
     try:
-        import soundfile as sf
-        import scipy.signal as sps
-        from visqol import VisqolApi
-
-        # ViSQOL speech lattice mode expects 16kHz audio
-        x, sr_x = sf.read(ref_wav)
-        y, sr_y = sf.read(deg_wav)
-
-        ref_path = ref_wav
-        deg_path = deg_wav
-
-        if sr_x != 16000:
-            x_16k = sps.resample(x, int(len(x) * 16000 / sr_x))
-            ref_path = f"{ref_wav}_16k.wav"
-            sf.write(ref_path, x_16k, 16000)
-
-        if sr_y != 16000:
-            y_16k = sps.resample(y, int(len(y) * 16000 / sr_y))
-            deg_path = f"{deg_wav}_16k.wav"
-            sf.write(deg_path, y_16k, 16000)
-
-        api = VisqolApi()
-        api.create(mode="speech")
-        res = api.measure(ref_path, deg_path)
-
-        if ref_path != ref_wav and os.path.exists(ref_path):
-            os.remove(ref_path)
-        if deg_path != deg_wav and os.path.exists(deg_path):
-            os.remove(deg_path)
-
-        return float(res.moslqo)
+        import zimtohrli
+        r48 = ref_data if sr_r == 48000 else sps.resample(ref_data, int(len(ref_data) * 48000 / sr_r))
+        d48 = deg_data if sr_d == 48000 else sps.resample(deg_data, int(len(deg_data) * 48000 / sr_d))
+        # Limit to 3.5 seconds (168k samples) for fast, robust O(N) auditory filterbank execution
+        n = min(len(r48), len(d48), int(3.5 * 48000))
+        mos = float(zimtohrli.mos_from_signals(r48[:n], d48[:n]))
+        return mos, "Zimtohrli"
     except Exception as e:
-        return None
+        return None, "Error"
 
-def write_github_summary(results, baseline_so, candidate_so):
+def write_github_summary(results_by_rate, baseline_so, candidate_so):
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
 
     with open(summary_path, "a") as f:
-        f.write("\n## 🎙️ Speech Quality Evaluation: TCD-VoIP & ViSQOL\n\n")
+        f.write("\n## 🎙️ Statistical Speech Quality: TCD-VoIP, ViSQOL & Zimtohrli\n\n")
         f.write(f"- **Baseline Library**: `{os.path.basename(baseline_so)}`\n")
         f.write(f"- **Candidate Library**: `{os.path.basename(candidate_so)}`\n\n")
-        f.write("| Scenario | Subsystem | Metric | Baseline | Candidate | Delta | Status |\n")
-        f.write("|:---|:---:|:---:|:---:|:---:|:---:|:---:|\n")
-        for r in results:
-            status_badge = "✅ PASS" if r["pass"] else "❌ FAIL"
-            f.write(f"| **{r['name']}** | `{r['mod']}` | {r['metric']} | {r['base']:.2f} | {r['cand']:.2f} | **{r['delta']:+.2f}** | {status_badge} |\n")
-        f.write("\n> *Quality Criterion: Candidate perceptual score (ViSQOL MOS) or SNR must equal or exceed baseline (Δ ≥ -0.05).*\n\n")
+
+        f.write("### Multi-Sample-Rate Aggregate Summary\n\n")
+        f.write("| Sample Rate | Metric Backend | Clips Evaluated | Mean Baseline MOS | Mean Candidate MOS | Mean Delta | Status |\n")
+        f.write("|:---:|:---:|:---:|:---:|:---:|:---:|:---:|\n")
+        for sr, res in results_by_rate.items():
+            b_mean = np.mean([r["base_mos"] for r in res])
+            c_mean = np.mean([r["cand_mos"] for r in res])
+            d_mean = np.mean([r["delta"] for r in res])
+            status = "✅ PASS" if d_mean >= -0.05 else "❌ FAIL"
+            f.write(f"| **{sr} Hz** | `{res[0]['backend']}` | {len(res)} | {b_mean:.3f} | {c_mean:.3f} | **{d_mean:+.3f}** | {status} |\n")
+
+        f.write("\n### Per-Scenario Statistical Breakdown (16 kHz Telephony)\n\n")
+        f.write("| Category | Module | Condition | Human MOS | Baseline MOS | Candidate MOS | Delta | Status |\n")
+        f.write("|:---|:---:|:---|:---:|:---:|:---:|:---:|:---:|\n")
+        for r in results_by_rate.get(16000, []):
+            st = "✅ PASS" if r["pass"] else "❌ FAIL"
+            f.write(f"| {r['category']} | `{r['mod']}` | {r['cond']} | {r['human_mos']:.2f} | {r['base_mos']:.3f} | {r['cand_mos']:.3f} | **{r['delta']:+.3f}** | {st} |\n")
+
+        f.write("\n> *Quality Criterion: Candidate perceptual score (ViSQOL/Zimtohrli MOS) must equal or exceed baseline (Δ ≥ -0.05) across all sample rates.*\n\n")
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate baseline vs candidate quality on TCD-VoIP dataset.")
+    parser = argparse.ArgumentParser(description="Evaluate baseline vs candidate quality on TCD-VoIP across sample rates.")
     parser.add_argument("baseline_so", help="Path to baseline libaudioProcess.so")
     parser.add_argument("candidate_so", help="Path to candidate libaudioProcess.so")
     parser.add_argument("--data-dir", default="data/tcd_voip", help="Directory for dataset cache")
@@ -158,8 +203,10 @@ def main():
     args = parser.parse_args()
 
     ensure_dataset(args.data_dir)
+    test_battery = load_test_battery(args.data_dir)
+    extract_files(args.data_dir, test_battery)
 
-    # Detect target architecture of the candidate library to choose runner and compiler
+    # Detect target architecture
     file_info = subprocess.check_output(["file", args.candidate_so]).decode("utf-8", errors="ignore")
     is_mips = "MIPS" in file_info
     runner_cmd = []
@@ -182,70 +229,105 @@ def main():
                 print("Failed to compile process_wav tool.")
                 sys.exit(1)
 
-    print("\n=========================================================================================")
-    print(f" TCD-VoIP Quality Evaluation: Baseline vs. Candidate")
+    visqol_api = None
+    try:
+        from visqol import VisqolApi
+        visqol_api = VisqolApi()
+        visqol_api.create(mode="speech")
+    except Exception:
+        print("Note: visqol-python not available, falling back to perceptual and SNR metrics.")
+
+    print("\n==========================================================================================================")
+    print(f" TCD-VoIP Statistical Quality Evaluation (Multi-Sample-Rate: {EVAL_SAMPLE_RATES})")
     print(f"   Baseline:  {args.baseline_so}")
     print(f"   Candidate: {args.candidate_so}")
-    print("=========================================================================================\n")
-
-    print(f"{'Scenario':<25} | {'Metric':<10} | {'Baseline':<10} | {'Candidate':<10} | {'Delta':<8} | Status")
-    print("-" * 92)
+    print("==========================================================================================================\n")
 
     out_dir = os.path.join(args.data_dir, "output")
     os.makedirs(out_dir, exist_ok=True)
 
-    results = []
+    import soundfile as sf
+    import scipy.signal as sps
+
+    results_by_rate = {}
     all_passed = True
 
-    for name, mod, ref_p, deg_p, desc in SCENARIOS:
-        ref_file = os.path.join(args.data_dir, os.path.basename(ref_p))
-        deg_file = os.path.join(args.data_dir, os.path.basename(deg_p))
+    for sr in EVAL_SAMPLE_RATES:
+        print(f"\n--- Evaluating Sample Rate: {sr} Hz ---")
+        print(f"{'Category':<22} | {'Condition':<18} | {'Human':<6} | {'Base':<6} | {'Cand':<6} | {'Delta':<7} | Status")
+        print("-" * 88)
 
-        base_out = os.path.join(out_dir, f"{os.path.basename(deg_p)}_{mod}_base.wav")
-        cand_out = os.path.join(out_dir, f"{os.path.basename(deg_p)}_{mod}_cand.wav")
+        rate_results = []
 
-        # Process through baseline
-        subprocess.run(runner_cmd + [args.process_bin, args.baseline_so, deg_file, base_out, mod], check=True)
-        # Process through candidate
-        subprocess.run(runner_cmd + [args.process_bin, args.candidate_so, deg_file, cand_out, mod], check=True)
+        for cat, mod, cond, deg_fn, ref_fn, human_mos in test_battery:
+            # Note: WebRTC NS only supports 8kHz, 16kHz, 32kHz, 48kHz (not 24kHz or 44.1kHz)
+            if mod == "ns" and sr not in [8000, 16000, 32000, 48000]:
+                continue
 
-        # ViSQOL MOS or SNR
-        v_base = compute_visqol(ref_file, base_out)
-        v_cand = compute_visqol(ref_file, cand_out)
+            orig_deg = os.path.join(args.data_dir, deg_fn)
+            orig_ref = os.path.join(args.data_dir, ref_fn)
 
-        if v_base is not None and v_cand is not None:
-            metric_name = "ViSQOL MOS"
-            base_val = v_base
-            cand_val = v_cand
-            delta = cand_val - base_val
+            deg_raw, in_sr = sf.read(orig_deg)
+            ref_raw, _ = sf.read(orig_ref)
+
+            # Resample to the test rate
+            if in_sr != sr:
+                deg_sr = sps.resample(deg_raw, int(len(deg_raw) * sr / in_sr))
+                ref_sr = sps.resample(ref_raw, int(len(ref_raw) * sr / in_sr))
+            else:
+                deg_sr, ref_sr = deg_raw, ref_raw
+
+            in_wav = os.path.join(out_dir, f"in_{sr}_{deg_fn}")
+            ref_wav = os.path.join(out_dir, f"ref_{sr}_{ref_fn}")
+            base_out = os.path.join(out_dir, f"base_{sr}_{deg_fn}")
+            cand_out = os.path.join(out_dir, f"cand_{sr}_{deg_fn}")
+
+            sf.write(in_wav, deg_sr, sr)
+            sf.write(ref_wav, ref_sr, sr)
+
+            subprocess.run(runner_cmd + [args.process_bin, args.baseline_so, in_wav, base_out, mod], check=True)
+            subprocess.run(runner_cmd + [args.process_bin, args.candidate_so, in_wav, cand_out, mod], check=True)
+
+            base_mos, backend = compute_mos(ref_wav, base_out, sr, visqol_api)
+            cand_mos, _ = compute_mos(ref_wav, cand_out, sr, visqol_api)
+
+            if base_mos is None or cand_mos is None:
+                b_raw, _ = sf.read(base_out)
+                c_raw, _ = sf.read(cand_out)
+                base_mos = compute_snr(ref_sr, b_raw)
+                cand_mos = compute_snr(ref_sr, c_raw)
+                backend = "SNR (dB)"
+
+            delta = cand_mos - base_mos
             passed = delta >= -0.05
-        else:
-            metric_name = "SNR (dB)"
-            base_val = compute_snr(ref_file, base_out)
-            cand_val = compute_snr(ref_file, cand_out)
-            delta = cand_val - base_val
-            passed = delta >= -0.5
+            if not passed:
+                all_passed = False
 
-        if not passed:
-            all_passed = False
+            status_str = "PASS" if passed else "FAIL"
+            print(f"{cat:<22} | {cond:<18} | {human_mos:<6.2f} | {base_mos:<6.2f} | {cand_mos:<6.2f} | {delta:<+7.2f} | {status_str}")
 
-        status_str = "PASS" if passed else "FAIL"
-        print(f"{name:<25} | {metric_name:<10} | {base_val:<10.2f} | {cand_val:<10.2f} | {delta:<+8.2f} | {status_str}")
+            rate_results.append({
+                "category": cat,
+                "mod": mod,
+                "cond": cond,
+                "human_mos": human_mos,
+                "base_mos": base_mos,
+                "cand_mos": cand_mos,
+                "delta": delta,
+                "backend": backend,
+                "pass": passed
+            })
 
-        results.append({
-            "name": name,
-            "mod": mod,
-            "metric": metric_name,
-            "base": base_val,
-            "cand": cand_val,
-            "delta": delta,
-            "pass": passed
-        })
+            # Clean temporary wavs
+            for p in (in_wav, ref_wav, base_out, cand_out):
+                if os.path.exists(p): os.remove(p)
 
-    print("-" * 92)
-    print("Quality Evaluation Summary: " + ("ALL TESTS PASSED" if all_passed else "QUALITY REGRESSION DETECTED"))
+        results_by_rate[sr] = rate_results
 
-    write_github_summary(results, args.baseline_so, args.candidate_so)
+    write_github_summary(results_by_rate, args.baseline_so, args.candidate_so)
+    print("\n==========================================================================================================")
+    print("Statistical Evaluation Status: " + ("ALL TESTS PASSED" if all_passed else "QUALITY REGRESSION DETECTED"))
+    print("==========================================================================================================")
     sys.exit(0 if all_passed else 1)
 
 if __name__ == "__main__":

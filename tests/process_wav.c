@@ -126,24 +126,49 @@ int main(int argc, char **argv)
 		fn_ns_free ns_free = dlsym(handle, "audio_process_ns_free");
 		if (ns_create && ns_set_cfg && ns_proc && ns_free) {
 			void *ns = ns_create();
-			ns_set_cfg(ns, sample_rate, 2);
-			int frame_size = sample_rate / 100; /* 10ms */
-			int num_frames = num_samples / frame_size;
-			float in_f[480] = {0}, out_f[480] = {0};
-			const float *inp = in_f;
-			float *outp = out_f;
+			if (ns_set_cfg(ns, sample_rate, 2) == 0) {
+				int frame_size = sample_rate / 100; /* 10ms */
+				int num_frames = num_samples / frame_size;
+				float in_f[480] = {0}, out_f[480] = {0};
+				const float *inp = in_f;
+				float *outp = out_f;
 
-			for (int f = 0; f < num_frames; f++) {
-				int16_t *chunk = samples + f * frame_size;
-				for (int i = 0; i < frame_size; i++) in_f[i] = (float)chunk[i];
-				ns_proc(ns, &inp, 1, &outp);
-				for (int i = 0; i < frame_size; i++) chunk[i] = clamp_i16(out_f[i]);
+				for (int f = 0; f < num_frames; f++) {
+					int16_t *chunk = samples + f * frame_size;
+					for (int i = 0; i < frame_size; i++) in_f[i] = (float)chunk[i];
+					ns_proc(ns, &inp, 1, &outp);
+					for (int i = 0; i < frame_size; i++) chunk[i] = clamp_i16(out_f[i]);
+				}
 			}
 			ns_free(ns);
 		}
 	}
 
-	/* 3. DRC / AGC */
+	/* 3. AGC */
+	if (run_all || strcmp(mod, "agc") == 0) {
+		fn_agc_create agc_create = dlsym(handle, "audio_process_agc_create");
+		fn_agc_set_config agc_set_cfg = dlsym(handle, "audio_process_agc_set_config");
+		fn_agc_process agc_proc = dlsym(handle, "audio_process_agc_process");
+		fn_agc_free agc_free = dlsym(handle, "audio_process_agc_free");
+		if (agc_create && agc_set_cfg && agc_proc && agc_free) {
+			void *agc = agc_create();
+			WebRtcAgcConfig cfg = { .targetLevelDbfs = 3, .compressionGaindB = 9, .limiterEnable = 1 };
+			agc_set_cfg(agc, 0, 255, 3, sample_rate, cfg);
+			int frame_size = sample_rate / 100; /* 10ms */
+			int num_frames = num_samples / frame_size;
+			for (int f = 0; f < num_frames; f++) {
+				int16_t *chunk = samples + f * frame_size;
+				const int16_t *inp = chunk;
+				int16_t *outp = chunk;
+				int32_t mic = 100;
+				uint8_t sat = 0;
+				agc_proc(agc, &inp, 1, frame_size, &outp, mic, &mic, 0, &sat);
+			}
+			agc_free(agc);
+		}
+	}
+
+	/* 4. DRC */
 	if (run_all || strcmp(mod, "drc") == 0) {
 		fn_drc_create drc_create = dlsym(handle, "audio_process_drc_create");
 		fn_drc_set_config drc_set_cfg = dlsym(handle, "audio_process_drc_set_config");

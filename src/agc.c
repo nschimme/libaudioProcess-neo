@@ -17,14 +17,13 @@ struct modern_agc {
 	int sample_rate;
 	WebRtcAgcConfig config;
 
-	/* Precomputed gain parameters */
-	float target_linear;     /* Linear target level: (32767/sqrt(2)) * 10^(-targetDbfs/20) */
-	float max_gain_linear;   /* Linear max boost: 10^(compressionGaindB/20) */
+	/* Precomputed gain parameters in Q12 */
+	int32_t target_lvl_q12;     /* Linear target peak in Q12 */
+	int32_t max_gain_q12;       /* Linear max boost in Q12: 10^(compressionGaindB/20) * 4096 */
 
 	/* Adaptive envelope & gain tracking state */
-	float current_gain;      /* Current linear gain factor */
-	float energy_env;        /* Smoothed signal RMS energy */
-	float peak_env;          /* Fast peak tracking */
+	int32_t current_gain_q12;   /* Current linear gain factor in Q12 */
+	int32_t env_level;          /* Smoothed subframe peak envelope */
 };
 
 void *audio_process_agc_create(void)
@@ -37,15 +36,15 @@ void *audio_process_agc_create(void)
 	st->max_level = 255;
 	st->mode = kAgcModeAdaptiveDigital;
 	st->sample_rate = 16000;
-	st->config.targetLevelDbfs = 3;   /* -3 dBFS */
+	st->config.targetLevelDbfs = 3;   /* -3 dBov */
 	st->config.compressionGaindB = 9; /* 9 dB boost */
 	st->config.limiterEnable = 1;     /* Limiter ON */
 
-	st->target_linear = (32767.0f / sqrtf(2.0f)) * powf(10.0f, -3.0f / 20.0f);
-	st->max_gain_linear = powf(10.0f, 9.0f / 20.0f);
-	st->current_gain = 1.0f;
-	st->energy_env = 0.0f;
-	st->peak_env = 0.0f;
+	float target_lin = (32767.0f / sqrtf(2.0f)) * powf(10.0f, -3.0f / 20.0f);
+	st->target_lvl_q12 = (int32_t)target_lin;
+	st->max_gain_q12 = (int32_t)(powf(10.0f, 9.0f / 20.0f) * 4096.0f);
+	st->current_gain_q12 = st->max_gain_q12;
+	st->env_level = 0;
 
 	return st;
 }
@@ -74,9 +73,10 @@ int audio_process_agc_set_config(void *agc, int min_level, int max_level,
 	if (st->config.compressionGaindB > 90)
 		st->config.compressionGaindB = 90;
 
-	/* Target linear RMS amplitude matching oracle */
-	st->target_linear = (32767.0f / sqrtf(2.0f)) * powf(10.0f, -(float)st->config.targetLevelDbfs / 20.0f);
-	st->max_gain_linear = powf(10.0f, (float)st->config.compressionGaindB / 20.0f);
+	float target_lin = (32767.0f / sqrtf(2.0f)) * powf(10.0f, -(float)st->config.targetLevelDbfs / 20.0f);
+	st->target_lvl_q12 = (int32_t)target_lin;
+	st->max_gain_q12 = (int32_t)(powf(10.0f, (float)st->config.compressionGaindB / 20.0f) * 4096.0f);
+	st->current_gain_q12 = st->max_gain_q12;
 
 	return 0;
 }
@@ -88,14 +88,14 @@ void audio_process_agc_get_config(void *agc, WebRtcAgcConfig *out)
 		*out = st->config;
 }
 
-static inline int16_t soft_limiter_fast(int32_t val)
+static inline int16_t soft_limiter_smooth(int32_t val)
 {
-	const int32_t thr = 27000;
+	const int32_t thr = 32000;
 	if (val > thr) {
-		val = thr + ((val - thr) >> 2);
+		val = thr + ((val - thr) >> 3);
 		if (val > 32767) val = 32767;
 	} else if (val < -thr) {
-		val = -(thr + ((-val - thr) >> 2));
+		val = -(thr + ((-val - thr) >> 3));
 		if (val < -32768) val = -32768;
 	}
 	return (int16_t)val;
@@ -117,163 +117,94 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 	if (saturation_warning)
 		*saturation_warning = 0;
 
-	const int16_t *__restrict__ in = in_near[0];
-	int16_t *__restrict__ out_buf = out[0];
+	const int16_t *__restrict__ p_in = in_near[0];
+	int16_t *__restrict__ p_out = out[0];
 
-	/* 32-bit integer energy and peak estimation (avoid 64-bit emulation on 32-bit MIPS) */
-	int32_t sum_sq_scaled = 0;
-	int16_t frame_peak = 0;
-	size_t i = 0;
-	for (; i + 3 < samples; i += 4) {
-		int32_t s0 = in[i];
-		int32_t s1 = in[i + 1];
-		int32_t s2 = in[i + 2];
-		int32_t s3 = in[i + 3];
+	/* Divide 10ms frame into 1ms subframes (16 samples at 16kHz, L = sample_rate / 1000) */
+	size_t sub_len = samples / 10;
+	if (sub_len < 4) sub_len = samples;
 
-		int32_t s0_sc = s0 >> 3;
-		int32_t s1_sc = s1 >> 3;
-		int32_t s2_sc = s2 >> 3;
-		int32_t s3_sc = s3 >> 3;
-		sum_sq_scaled += s0_sc * s0_sc + s1_sc * s1_sc + s2_sc * s2_sc + s3_sc * s3_sc;
-
-		int16_t a0 = (s0 >= 0) ? (int16_t)s0 : (int16_t)(-s0);
-		int16_t a1 = (s1 >= 0) ? (int16_t)s1 : (int16_t)(-s1);
-		int16_t a2 = (s2 >= 0) ? (int16_t)s2 : (int16_t)(-s2);
-		int16_t a3 = (s3 >= 0) ? (int16_t)s3 : (int16_t)(-s3);
-		if (a0 > frame_peak) frame_peak = a0;
-		if (a1 > frame_peak) frame_peak = a1;
-		if (a2 > frame_peak) frame_peak = a2;
-		if (a3 > frame_peak) frame_peak = a3;
-	}
-	for (; i < samples; i++) {
-		int32_t s = in[i];
-		int32_t s_sc = s >> 3;
-		sum_sq_scaled += s_sc * s_sc;
-		int16_t abs_s = (s >= 0) ? (int16_t)s : (int16_t)(-s);
-		if (abs_s > frame_peak) frame_peak = abs_s;
-	}
-
-	float frame_rms = sqrtf((float)sum_sq_scaled / (float)samples) * 8.0f;
-
-	/* Dual envelope update (attack 10ms, release 300ms) */
-	float alpha_rms = (frame_rms > st->energy_env) ? 0.35f : 0.035f;
-	st->energy_env += alpha_rms * (frame_rms - st->energy_env);
-
-	float f_peak = (float)frame_peak;
-	float alpha_peak = (f_peak > st->peak_env) ? 0.5f : 0.05f;
-	st->peak_env += alpha_peak * (f_peak - st->peak_env);
-
-	/* Compute target gain based on tracked RMS level */
-	float desired_gain = st->max_gain_linear;
-	if (st->energy_env > 10.0f) {
-		float calc_gain = st->target_linear / st->energy_env;
-		desired_gain = AGC_MIN(st->max_gain_linear, calc_gain);
-	}
-
-	/* Peak ceiling protection: ensure peak * gain does not blow past full scale */
-	if (st->peak_env > 10.0f && st->config.limiterEnable) {
-		float peak_gain_cap = 30000.0f / st->peak_env;
-		if (peak_gain_cap < desired_gain)
-			desired_gain = peak_gain_cap;
-	}
-
-	/* Prevent digital expansion on absolute noise floor */
-	if (st->energy_env < 30.0f) {
-		desired_gain = AGC_MIN(desired_gain, 1.0f);
-	}
-
-	/* Gain smoothing across frames */
-	float alpha_gain = (desired_gain < st->current_gain) ? 0.25f : 0.05f;
-	float start_gain = st->current_gain;
-	float end_gain = start_gain + alpha_gain * (desired_gain - start_gain);
-	st->current_gain = end_gain;
-
-	/* Fixed-point Q12 gain interpolation (32-bit math for single-cycle MIPS multiply) */
-	int32_t g_q12 = (int32_t)(start_gain * 4096.0f);
-	int32_t end_g_q12 = (int32_t)(end_gain * 4096.0f);
-	int32_t step_q12 = (end_g_q12 - g_q12) / (int32_t)samples;
-
+	size_t num_subs = samples / sub_len;
 	int limiter_on = st->config.limiterEnable;
+	int32_t max_g = st->max_gain_q12;
+	int32_t target_peak = st->target_lvl_q12;
 	uint8_t saturated = 0;
 
-	const int16_t *__restrict__ p_in = in;
-	int16_t *__restrict__ p_out = out_buf;
+	for (size_t sub = 0; sub < num_subs; sub++) {
+		const int16_t *s_in = p_in + sub * sub_len;
+		int16_t *s_out = p_out + sub * sub_len;
 
-	/* Fast-path: check if maximum possible output stays well within linear range */
-	int32_t max_out = ((int32_t)frame_peak * AGC_MAX(g_q12, end_g_q12)) >> 12;
-	if (limiter_on && max_out < 27000) {
-		i = 0;
-		for (; i + 3 < samples; i += 4) {
-			g_q12 += step_q12;
-			*p_out++ = (int16_t)(((int32_t)*p_in++ * g_q12) >> 12);
-			g_q12 += step_q12;
-			*p_out++ = (int16_t)(((int32_t)*p_in++ * g_q12) >> 12);
-			g_q12 += step_q12;
-			*p_out++ = (int16_t)(((int32_t)*p_in++ * g_q12) >> 12);
-			g_q12 += step_q12;
-			*p_out++ = (int16_t)(((int32_t)*p_in++ * g_q12) >> 12);
+		/* Measure subframe peak */
+		int32_t peak = 0;
+		size_t j = 0;
+		for (; j + 3 < sub_len; j += 4) {
+			int32_t a0 = abs(s_in[j]);
+			int32_t a1 = abs(s_in[j+1]);
+			int32_t a2 = abs(s_in[j+2]);
+			int32_t a3 = abs(s_in[j+3]);
+			if (a0 > peak) peak = a0;
+			if (a1 > peak) peak = a1;
+			if (a2 > peak) peak = a2;
+			if (a3 > peak) peak = a3;
 		}
-		for (; i < samples; i++) {
-			g_q12 += step_q12;
-			*p_out++ = (int16_t)(((int32_t)*p_in++ * g_q12) >> 12);
+		for (; j < sub_len; j++) {
+			int32_t a = abs(s_in[j]);
+			if (a > peak) peak = a;
 		}
-	} else if (limiter_on) {
-		i = 0;
-		for (; i + 3 < samples; i += 4) {
-			g_q12 += step_q12;
-			int32_t y0 = ((int32_t)*p_in++ * g_q12) >> 12;
-			g_q12 += step_q12;
-			int32_t y1 = ((int32_t)*p_in++ * g_q12) >> 12;
-			g_q12 += step_q12;
-			int32_t y2 = ((int32_t)*p_in++ * g_q12) >> 12;
-			g_q12 += step_q12;
-			int32_t y3 = ((int32_t)*p_in++ * g_q12) >> 12;
 
-			*p_out++ = soft_limiter_fast(y0);
-			*p_out++ = soft_limiter_fast(y1);
-			*p_out++ = soft_limiter_fast(y2);
-			*p_out++ = soft_limiter_fast(y3);
+		/* Asymmetric envelope smoothing */
+		if (peak > st->env_level)
+			st->env_level += (peak - st->env_level) >> 2; /* Fast 1ms attack */
+		else
+			st->env_level += (peak - st->env_level) >> 11; /* Smooth release */
 
-			if (y0 > 32000 || y0 < -32000 || y1 > 32000 || y1 < -32000 ||
-			    y2 > 32000 || y2 < -32000 || y3 > 32000 || y3 < -32000) {
-				saturated = 1;
+		/* Subframe gain mapping */
+		int32_t desired_g = max_g;
+		if (st->env_level > 500) {
+			int32_t g = (target_peak << 12) / st->env_level;
+			if (g < desired_g) desired_g = g;
+		} else if (st->env_level < 50) {
+			desired_g = AGC_MIN(desired_g, 4096);
+		}
+
+		/* Smooth gain transitions across 1ms subframes */
+		st->current_gain_q12 += (desired_g - st->current_gain_q12) >> 3;
+		int32_t g = st->current_gain_q12;
+
+		/* Apply gain with soft limiter */
+		if (limiter_on) {
+			size_t k = 0;
+			for (; k + 3 < sub_len; k += 4) {
+				int32_t y0 = ((int32_t)s_in[k] * g) >> 12;
+				int32_t y1 = ((int32_t)s_in[k+1] * g) >> 12;
+				int32_t y2 = ((int32_t)s_in[k+2] * g) >> 12;
+				int32_t y3 = ((int32_t)s_in[k+3] * g) >> 12;
+
+				s_out[k] = soft_limiter_smooth(y0);
+				s_out[k+1] = soft_limiter_smooth(y1);
+				s_out[k+2] = soft_limiter_smooth(y2);
+				s_out[k+3] = soft_limiter_smooth(y3);
+
+				if (y0 > 32000 || y0 < -32000 || y1 > 32000 || y1 < -32000 ||
+				    y2 > 32000 || y2 < -32000 || y3 > 32000 || y3 < -32000)
+					saturated = 1;
 			}
-		}
-		for (; i < samples; i++) {
-			g_q12 += step_q12;
-			int32_t y = ((int32_t)*p_in++ * g_q12) >> 12;
-			if (y > 32000 || y < -32000)
-				saturated = 1;
-			*p_out++ = soft_limiter_fast(y);
-		}
-	} else {
-		i = 0;
-		for (; i + 3 < samples; i += 4) {
-			g_q12 += step_q12;
-			int32_t y0 = ((int32_t)*p_in++ * g_q12) >> 12;
-			g_q12 += step_q12;
-			int32_t y1 = ((int32_t)*p_in++ * g_q12) >> 12;
-			g_q12 += step_q12;
-			int32_t y2 = ((int32_t)*p_in++ * g_q12) >> 12;
-			g_q12 += step_q12;
-			int32_t y3 = ((int32_t)*p_in++ * g_q12) >> 12;
-
-			*p_out++ = clamp_i16(y0);
-			*p_out++ = clamp_i16(y1);
-			*p_out++ = clamp_i16(y2);
-			*p_out++ = clamp_i16(y3);
-
-			if (y0 > 32767 || y0 < -32768 || y1 > 32767 || y1 < -32768 ||
-			    y2 > 32767 || y2 < -32768 || y3 > 32767 || y3 < -32768) {
-				saturated = 1;
+			for (; k < sub_len; k++) {
+				int32_t y = ((int32_t)s_in[k] * g) >> 12;
+				if (y > 32000 || y < -32000) saturated = 1;
+				s_out[k] = soft_limiter_smooth(y);
 			}
-		}
-		for (; i < samples; i++) {
-			g_q12 += step_q12;
-			int32_t y = ((int32_t)*p_in++ * g_q12) >> 12;
-			if (y > 32767 || y < -32768)
-				saturated = 1;
-			*p_out++ = clamp_i16(y);
+		} else {
+			size_t k = 0;
+			for (; k + 3 < sub_len; k += 4) {
+				s_out[k] = clamp_i16(((int32_t)s_in[k] * g) >> 12);
+				s_out[k+1] = clamp_i16(((int32_t)s_in[k+1] * g) >> 12);
+				s_out[k+2] = clamp_i16(((int32_t)s_in[k+2] * g) >> 12);
+				s_out[k+3] = clamp_i16(((int32_t)s_in[k+3] * g) >> 12);
+			}
+			for (; k < sub_len; k++) {
+				s_out[k] = clamp_i16(((int32_t)s_in[k] * g) >> 12);
+			}
 		}
 	}
 
@@ -281,11 +212,9 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 	for (size_t b = 1; b < num_bands; b++) {
 		const int16_t *__restrict__ in_b = in_near[b];
 		int16_t *__restrict__ out_b = out[b];
-		int32_t gb_q12 = (int32_t)(start_gain * 4096.0f);
+		int32_t g = st->current_gain_q12;
 		for (size_t j = 0; j < samples; j++) {
-			gb_q12 += step_q12;
-			int32_t y = ((int32_t)*in_b++ * gb_q12) >> 12;
-			*out_b++ = clamp_i16(y);
+			out_b[j] = clamp_i16(((int32_t)in_b[j] * g) >> 12);
 		}
 	}
 

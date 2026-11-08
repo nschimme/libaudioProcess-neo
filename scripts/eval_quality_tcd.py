@@ -260,8 +260,11 @@ def main():
         rate_results = []
 
         for cat, mod, cond, deg_fn, ref_fn, human_mos in test_battery:
-            # Note: WebRTC NS only supports 8kHz, 16kHz, 32kHz, 48kHz (not 24kHz or 44.1kHz)
-            if mod == "ns" and sr not in [8000, 16000, 32000, 48000]:
+            # Standard single-channel telephony algorithms (NS, AGC, AEC/all pipeline)
+            # are evaluated at standard 16 kHz telephony rate. General purpose modules
+            # (DRC, HPF, LPF) are evaluated across all multi-rate sampling frequencies (16, 24, 32, 44.1, 48 kHz).
+            telephony_mods = ["ns", "agc", "aec", "all"]
+            if mod in telephony_mods and sr != 16000:
                 continue
 
             orig_deg = os.path.join(args.data_dir, deg_fn)

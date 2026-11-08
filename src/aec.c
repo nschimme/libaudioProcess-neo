@@ -16,6 +16,13 @@
  *
  * Implements high-throughput, low-latency, linear/non-linear Acoustic Echo Cancellation
  * supporting 8 kHz, 16 kHz, 24 kHz, 32 kHz, 44.1 kHz, and 48 kHz.
+ *
+ * Design features:
+ *  - Partitioned Block Frequency-Domain Adaptive Filtering with O(N log N) RDFT execution
+ *  - Normalized gradient step-size adaptation (LMS / MDF) with profile parameters (mu_min, mu_decay)
+ *  - Frequency-dependent Wiener spectral subtraction for artifact-free residual suppression
+ *  - Double-Talk Detection (DTD) with coherence and structural chassis mechanical margin
+ *  - Arbitrary sample rate support using a unified block-based sub-frame architecture
  */
 
 #define AEC_MAX_BLOCK_LEN   128
@@ -75,7 +82,6 @@ struct aec_state {
 };
 
 /* Helper: complex multiplication and accumulate in Ooura packed format */
-/* Format: a[0]=DC, a[1]=Nyq, a[2*k]=Re, a[2*k+1]=-Im */
 static inline void complex_mul_add(float *__restrict__ y,
 				   const float *__restrict__ x,
 				   const float *__restrict__ w,
@@ -231,11 +237,11 @@ static void pbfdaf_process_block(struct aec_state *st,
 	}
 
 	/* 6. Filter adaptation in frequency domain */
-	if (!double_talk && far_energy > st->far_pow_thd) {
-		float e_time[AEC_MAX_FFT_LEN] = {0};
-		memcpy(e_time + L, e_linear, L * sizeof(float));
-		audio_process_rdft(N, 1, e_time);
+	float e_time[AEC_MAX_FFT_LEN] = {0};
+	memcpy(e_time + L, e_linear, L * sizeof(float));
+	audio_process_rdft(N, 1, e_time);
 
+	if (!double_talk && far_energy > st->far_pow_thd) {
 		for (int p = 0; p < P; p++) {
 			int idx = (st->x_pos + p) % P;
 			complex_gradient_update(st->W_freq[p], e_time, st->X_freq[idx], step_bins, N);
@@ -258,20 +264,60 @@ static void pbfdaf_process_block(struct aec_state *st,
 		}
 	}
 
-	/* 7. Non-Linear Processor (NLP) & Residual Echo Suppression */
-	for (int i = 0; i < L; i++) {
-		float e_val = e_linear[i];
-
-		if (!double_talk && far_energy > st->far_pow_thd) {
-			float suppr_factor;
-			if (st->nlp_mode == 0) suppr_factor = 0.15f;
-			else if (st->nlp_mode == 1) suppr_factor = 0.04f;
-			else suppr_factor = 0.005f;
-
-			e_val *= suppr_factor;
+	/* 7. Frequency-Domain Wiener Residual Echo Suppression */
+	if (!double_talk && far_energy > st->far_pow_thd) {
+		float min_floor;
+		float oversub;
+		if (st->nlp_mode == 0) {
+			min_floor = 0.15f;
+			oversub = 1.0f;
+		} else if (st->nlp_mode == 1) {
+			min_floor = 0.03f;
+			oversub = 1.4f;
+		} else {
+			min_floor = 0.005f;
+			oversub = 2.0f;
 		}
 
-		out_block[i] = e_val;
+		/* Scale residual according to safe_suppression */
+		if (st->safe_suppression > 0.0f && st->safe_suppression < 1.0f) {
+			min_floor *= st->safe_suppression;
+		}
+
+		/* Compute frequency-selective Wiener suppression mask */
+		float g_dc = 1.0f - oversub * fabsf(Y_freq[0]) / (fabsf(e_time[0]) + 10.0f);
+		if (g_dc < min_floor) g_dc = min_floor;
+		if (g_dc > 1.0f) g_dc = 1.0f;
+		e_time[0] *= g_dc;
+
+		float g_nyq = 1.0f - oversub * fabsf(Y_freq[1]) / (fabsf(e_time[1]) + 10.0f);
+		if (g_nyq < min_floor) g_nyq = min_floor;
+		if (g_nyq > 1.0f) g_nyq = 1.0f;
+		e_time[1] *= g_nyq;
+
+		for (int k = 1; k < half_n; k++) {
+			int r_idx = 2 * k;
+			int i_idx = 2 * k + 1;
+
+			float ey_pwr = Y_freq[r_idx] * Y_freq[r_idx] + Y_freq[i_idx] * Y_freq[i_idx];
+			float ee_pwr = e_time[r_idx] * e_time[r_idx] + e_time[i_idx] * e_time[i_idx] + 100.0f;
+
+			float g_bin = 1.0f - oversub * sqrtf(ey_pwr / ee_pwr);
+			if (g_bin < min_floor) g_bin = min_floor;
+			if (g_bin > 1.0f) g_bin = 1.0f;
+
+			e_time[r_idx] *= g_bin;
+			e_time[i_idx] *= g_bin;
+		}
+
+		/* Transform synthesized suppression back to time domain */
+		audio_process_rdft(N, -1, e_time);
+		for (int i = 0; i < L; i++) {
+			out_block[i] = e_time[L + i] * ifft_scale;
+		}
+	} else {
+		/* Double-talk or silence: linear output preserves voice 100% transparently */
+		memcpy(out_block, e_linear, L * sizeof(float));
 	}
 }
 
@@ -378,14 +424,8 @@ int audio_process_aec_process(struct aec_handle *h, struct aec_frame *f)
 				memmove(st->out_fifo, st->out_fifo + samples_10ms, st->out_avail * sizeof(float));
 			}
 		} else {
-			/* Startup priming: output zero-latency silence or available samples without stale read */
-			for (int i = 0; i < samples_10ms; i++) {
-				if (i < st->near_avail) {
-					near_ptr[i] = clamp_i16(st->near_fifo[i]);
-				} else {
-					near_ptr[i] = 0;
-				}
-			}
+			/* Startup priming: output zero-latency silence for the initial block */
+			memset(near_ptr, 0, samples_10ms * sizeof(int16_t));
 		}
 
 		far_ptr += samples_10ms;

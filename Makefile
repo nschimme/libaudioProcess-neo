@@ -21,12 +21,12 @@ SRCDIR  = src
 # Our modules
 MOD_SRC = $(addprefix $(SRCDIR)/, \
 	aec.c agc.c ns.c hpf.c lpf.c \
-	howling.c drc.c eq.c drc_eq.c biquad.c config.c)
+	howling.c drc.c eq.c drc_eq.c biquad.c config.c fft.c)
 
-# WebRTC AEC
+# WebRTC AEC (Replaced aec_rdft with clean-room src/fft.c)
 AEC_SRC = $(addprefix $(SRCDIR)/webrtc/modules/audio_processing/aec/, \
 	aec_core.c aec_core_mips.c echo_cancellation.c \
-	aec_rdft.c aec_rdft_mips.c aec_resampler.c)
+	aec_resampler.c)
 
 # WebRTC AGC (Replaced by clean-room src/agc.c)
 AGC_SRC =
@@ -39,9 +39,9 @@ NS_SRC = $(addprefix $(SRCDIR)/webrtc/modules/audio_processing/ns/, \
 UTIL_SRC = $(addprefix $(SRCDIR)/webrtc/modules/audio_processing/utility/, \
 	delay_estimator.c delay_estimator_wrapper.c)
 
-# WebRTC common audio
+# WebRTC common audio (Replaced fft4g.c with clean-room src/fft.c)
 COMMON_SRC = $(addprefix $(SRCDIR)/webrtc/common_audio/, \
-	ring_buffer.c fft4g.c)
+	ring_buffer.c)
 
 # WebRTC SPL
 SPL_SRC = $(addprefix $(SRCDIR)/webrtc/common_audio/signal_processing/, \
@@ -95,7 +95,7 @@ size: $(TARGET)
 	@nm -D --defined-only $(TARGET) | grep -c ' T '
 
 test:
-	gcc -std=c11 -D_GNU_SOURCE -O2 -rdynamic -Isrc src/agc.c src/biquad.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/webrtc/common_audio/fft4g.c src/webrtc/common_audio/signal_processing/copy_set_operations.c tests/unit_tests.c -ldl -lm -o tests/unit_tests_bin
+	gcc -std=c11 -D_GNU_SOURCE -O2 -rdynamic -Isrc src/agc.c src/biquad.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/fft.c src/webrtc/common_audio/signal_processing/copy_set_operations.c tests/unit_tests.c -ldl -lm -o tests/unit_tests_bin
 	./tests/unit_tests_bin
 	rm -f tests/unit_tests_bin
 

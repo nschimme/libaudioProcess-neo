@@ -467,6 +467,43 @@ static void test_aec_guardrails(void)
 	printf("  -> PASS\n");
 }
 
+/* Test 11: Real-valued FFT / IFFT Roundtrip & Energy Conservation */
+static void test_fft_guardrails(void)
+{
+	printf("Running test_fft_guardrails...\n");
+	extern void audio_process_rdft(size_t n, int isgn, float *a);
+
+	int sizes[] = {128, 256, 512};
+	for (int s = 0; s < 3; s++) {
+		int n = sizes[s];
+		float orig[512], a[512];
+		float orig_energy = 0.0f;
+		for (int i = 0; i < n; i++) {
+			orig[i] = sinf((float)i * 0.25f) + 0.5f * cosf((float)i * 0.77f);
+			a[i] = orig[i];
+			orig_energy += orig[i] * orig[i];
+		}
+
+		audio_process_rdft(n, 1, a);
+		audio_process_rdft(n, -1, a);
+
+		float max_recon_err = 0.0f;
+		float recon_energy = 0.0f;
+		for (int i = 0; i < n; i++) {
+			float r = a[i] * 2.0f / (float)n;
+			recon_energy += r * r;
+			float err = fabsf(r - orig[i]);
+			if (err > max_recon_err)
+				max_recon_err = err;
+		}
+
+		ASSERT_TRUE(max_recon_err < 1e-4f, "FFT roundtrip max error within 1e-4");
+		float energy_diff = fabsf(recon_energy - orig_energy) / orig_energy;
+		ASSERT_TRUE(energy_diff < 1e-4f, "FFT energy conserved within 1e-4");
+	}
+	printf("  -> PASS\n");
+}
+
 int main(void)
 {
 	printf("=========================================================\n");
@@ -483,7 +520,8 @@ int main(void)
 	test_agc_guardrails();
 	test_ns_guardrails();
 	test_aec_guardrails();
+	test_fft_guardrails();
 
-	printf("\nAll 10 Unit & E2E Quality Tests Passed Successfully!\n");
+	printf("\nAll 11 Unit & E2E Quality Tests Passed Successfully!\n");
 	return 0;
 }

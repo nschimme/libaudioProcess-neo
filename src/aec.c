@@ -20,6 +20,8 @@
  * Design features:
  *  - Partitioned Block Frequency-Domain Adaptive Filtering with O(N log N) RDFT execution
  *  - Normalized gradient step-size adaptation (LMS / MDF) with profile parameters (mu_min, mu_decay)
+ *  - Hardware delay compensation for DAC-to-ADC propagation latency (delay_ms)
+ *  - Hardware acoustic resonance notch / band restraint (restrain_band_center, wide, factor)
  *  - Frequency-dependent Wiener spectral subtraction for artifact-free residual suppression
  *  - Double-Talk Detection (DTD) with coherence and structural chassis mechanical margin
  *  - Arbitrary sample rate support using a unified block-based sub-frame architecture
@@ -28,6 +30,7 @@
 #define AEC_MAX_BLOCK_LEN   128
 #define AEC_MAX_FFT_LEN     256
 #define AEC_NUM_PARTITIONS  8
+#define AEC_MAX_DELAY_SAMP  4800  /* Up to 100ms at 48kHz */
 
 struct aec_state {
 	int block_len;            /* L: frame partition length (e.g. 64 or 128) */
@@ -37,6 +40,11 @@ struct aec_state {
 	/* Audio rate tracking */
 	int sample_rate;
 	int samples_10ms;
+
+	/* Far-end delay compensation buffer */
+	float far_delay_buf[AEC_MAX_DELAY_SAMP + AEC_MAX_BLOCK_LEN * 4];
+	int   delay_samples;
+	int   far_delay_avail;
 
 	/* Input ring/FIFO buffers for block framing */
 	float far_fifo[AEC_MAX_BLOCK_LEN * 8];
@@ -71,6 +79,11 @@ struct aec_state {
 	float safe_suppression;
 	float chassis_margin_db;
 	int   nlp_mode;
+
+	/* Hardware band restraint (chassis resonance damping) */
+	int   restrain_bin_start;
+	int   restrain_bin_end;
+	float restrain_factor;
 
 	/* DTD state */
 	int   dtd_hangover;
@@ -129,7 +142,6 @@ static inline void complex_gradient_update(float *__restrict__ w,
 		float xi = -x[im_idx]; /* conj(X) -> xr - j*xi */
 		float step = step_bins[k];
 
-		/* E * conj(X) = (er + j*ei) * (xr - j*xi) = (er*xr + ei*xi) + j*(ei*xr - er*xi) */
 		float gr = er * xr + ei * xi;
 		float gi = ei * xr - er * xi;
 
@@ -212,14 +224,10 @@ static void pbfdaf_process_block(struct aec_state *st,
 	st->far_pwr_smooth = 0.8f * st->far_pwr_smooth + 0.2f * far_energy;
 	st->echo_pwr_smooth = 0.8f * st->echo_pwr_smooth + 0.2f * echo_energy;
 
-	/*
-	 * Coherence / Double-Talk Detection:
-	 * Double talk is detected when near-end mic has high speech energy that is NOT
-	 * correlated with far-end speaker energy (accounting for structural chassis margin).
-	 */
+	/* Coherence / Double-Talk Detection */
 	bool double_talk = false;
 	if (st->near_pwr_smooth > 2.0f * st->far_pwr_smooth && st->near_pwr_smooth > 1e6f) {
-		st->dtd_hangover = 10; /* ~10 blocks hangover */
+		st->dtd_hangover = 10;
 		double_talk = true;
 	} else if (st->dtd_hangover > 0) {
 		st->dtd_hangover--;
@@ -264,7 +272,7 @@ static void pbfdaf_process_block(struct aec_state *st,
 		}
 	}
 
-	/* 7. Frequency-Domain Wiener Residual Echo Suppression */
+	/* 7. Frequency-Domain Wiener Residual Echo Suppression & Band Restraint */
 	if (!double_talk && far_energy > st->far_pow_thd) {
 		float min_floor;
 		float oversub;
@@ -279,12 +287,10 @@ static void pbfdaf_process_block(struct aec_state *st,
 			oversub = 2.0f;
 		}
 
-		/* Scale residual according to safe_suppression */
 		if (st->safe_suppression > 0.0f && st->safe_suppression < 1.0f) {
 			min_floor *= st->safe_suppression;
 		}
 
-		/* Compute frequency-selective Wiener suppression mask */
 		float g_dc = 1.0f - oversub * fabsf(Y_freq[0]) / (fabsf(e_time[0]) + 10.0f);
 		if (g_dc < min_floor) g_dc = min_floor;
 		if (g_dc > 1.0f) g_dc = 1.0f;
@@ -303,6 +309,12 @@ static void pbfdaf_process_block(struct aec_state *st,
 			float ee_pwr = e_time[r_idx] * e_time[r_idx] + e_time[i_idx] * e_time[i_idx] + 100.0f;
 
 			float g_bin = 1.0f - oversub * sqrtf(ey_pwr / ee_pwr);
+
+			/* Apply hardware enclosure band restraint on resonance frequencies */
+			if (k >= st->restrain_bin_start && k <= st->restrain_bin_end && st->restrain_factor > 0.0f) {
+				g_bin *= (1.0f - st->restrain_factor);
+			}
+
 			if (g_bin < min_floor) g_bin = min_floor;
 			if (g_bin > 1.0f) g_bin = 1.0f;
 
@@ -310,13 +322,11 @@ static void pbfdaf_process_block(struct aec_state *st,
 			e_time[i_idx] *= g_bin;
 		}
 
-		/* Transform synthesized suppression back to time domain */
 		audio_process_rdft(N, -1, e_time);
 		for (int i = 0; i < L; i++) {
 			out_block[i] = e_time[L + i] * ifft_scale;
 		}
 	} else {
-		/* Double-talk or silence: linear output preserves voice 100% transparently */
 		memcpy(out_block, e_linear, L * sizeof(float));
 	}
 }
@@ -357,12 +367,31 @@ void *audio_process_aec_create(int sample_rate, const char *profile_path)
 	st->near_gain = cfg.near_gain;
 	st->nlp_mode = cfg.nlp_mode;
 
+	/* Hardware delay compensation */
+	if (cfg.delay_ms > 0) {
+		st->delay_samples = (cfg.delay_ms * sample_rate) / 1000;
+		if (st->delay_samples > AEC_MAX_DELAY_SAMP)
+			st->delay_samples = AEC_MAX_DELAY_SAMP;
+	}
+
+	/* Ingenic profile parameters */
 	st->mu = (cfg.user_mode && cfg.mu_min > 0.0f) ? 0.35f : 0.25f;
 	st->mu_min = (cfg.user_mode && cfg.mu_min > 0.0f) ? cfg.mu_min : 0.05f;
 	st->mu_decay = (cfg.user_mode && cfg.mu_decay > 0.0f) ? cfg.mu_decay : 0.998f;
 	st->far_pow_thd = (cfg.user_mode && cfg.far_pow_thd > 0.0f) ? cfg.far_pow_thd : 50.0f;
 	st->safe_suppression = (cfg.user_mode && cfg.safe_suppression > 0.0f) ? cfg.safe_suppression : 1.0f;
 	st->chassis_margin_db = 4.5f;
+
+	/* Hardware chassis acoustic resonance notch / band restraint */
+	if (cfg.user_mode && cfg.restrain_band_wide > 0 && cfg.restrain_factor > 0.0f) {
+		float bin_hz = (float)sample_rate / (float)st->fft_len;
+		float f_low = (float)cfg.restrain_band_center - (float)cfg.restrain_band_wide * 0.5f;
+		float f_high = (float)cfg.restrain_band_center + (float)cfg.restrain_band_wide * 0.5f;
+		if (f_low < 0.0f) f_low = 0.0f;
+		st->restrain_bin_start = (int)(f_low / bin_hz);
+		st->restrain_bin_end = (int)(f_high / bin_hz);
+		st->restrain_factor = (cfg.restrain_factor > 0.9f) ? 0.9f : cfg.restrain_factor;
+	}
 
 	audio_process_rdft(st->fft_len, 1, NULL);
 
@@ -390,11 +419,35 @@ int audio_process_aec_process(struct aec_handle *h, struct aec_frame *f)
 	int16_t *near_ptr = f->near;
 
 	for (int frm = 0; frm < num_frames; frm++) {
+		/* Apply delay compensation to far-end signal if delay_ms is configured */
+		if (st->delay_samples > 0) {
+			for (int i = 0; i < samples_10ms; i++) {
+				st->far_delay_buf[st->far_delay_avail + i] = (float)far_ptr[i] * far_gain;
+			}
+			st->far_delay_avail += samples_10ms;
+
+			if (st->far_delay_avail > st->delay_samples) {
+				int pull_count = st->far_delay_avail - st->delay_samples;
+				if (pull_count > samples_10ms) pull_count = samples_10ms;
+				for (int i = 0; i < pull_count; i++) {
+					st->far_fifo[st->far_avail + i] = st->far_delay_buf[i];
+				}
+				st->far_avail += pull_count;
+				st->far_delay_avail -= pull_count;
+				if (st->far_delay_avail > 0) {
+					memmove(st->far_delay_buf, st->far_delay_buf + pull_count, st->far_delay_avail * sizeof(float));
+				}
+			}
+		} else {
+			for (int i = 0; i < samples_10ms; i++) {
+				st->far_fifo[st->far_avail + i] = (float)far_ptr[i] * far_gain;
+			}
+			st->far_avail += samples_10ms;
+		}
+
 		for (int i = 0; i < samples_10ms; i++) {
-			st->far_fifo[st->far_avail + i] = (float)far_ptr[i] * far_gain;
 			st->near_fifo[st->near_avail + i] = (float)near_ptr[i] * near_gain;
 		}
-		st->far_avail += samples_10ms;
 		st->near_avail += samples_10ms;
 
 		while (st->far_avail >= L && st->near_avail >= L) {

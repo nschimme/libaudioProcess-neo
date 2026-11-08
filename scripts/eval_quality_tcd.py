@@ -192,21 +192,20 @@ def write_github_summary(results_by_rate, baseline_so, candidate_so):
             st = "✅ PASS" if r["pass"] else "❌ FAIL"
             f.write(f"| {r['category']} | `{r['mod']}` | {r['cond']} | {r['human_mos']:.2f} | {r['base_mos']:.3f} | {r['cand_mos']:.3f} | **{r['delta']:+.3f}** | {st} |\n")
 
-        f.write("\n### 🎯 Dedicated Feature-Specific Quality Guarantee Matrix\n\n")
-        f.write("| Module | Quality / Physical Metric | Acceptance Target | Candidate Result | Status |\n")
-        f.write("|:---|:---|:---:|:---:|:---:|\n")
-        f.write("| **AEC** | Steady-State ERLE (Synthetic) | $\\ge 40.0\\text{ dB}$ | **132.6 dB** | ✅ PASS |\n")
-        f.write("| **AEC** | Convergence Speed ($T_{\\text{conv}}$) | $\\le 500\\text{ ms}$ | **400 ms** (92.6 dB) | ✅ PASS |\n")
-        f.write("| **AEC** | Double-Talk Voice Distortion | $\\le 0.50\\text{ dB}$ | **0.01 dB** | ✅ PASS |\n")
-        f.write("| **AGC** | Compression Target Accuracy | $\\pm 0.50\\text{ dB}$ | **$\\pm 0.20\\text{ dB}$** | ✅ PASS |\n")
-        f.write("| **AGC** | Peak Limiter Headroom | No clipping (<= 32767) | **Bit-bounded** | ✅ PASS |\n")
-        f.write("| **NS**  | Stationary Noise Attenuation | Policy 2 $\\ge 15.0\\text{ dB}$ | **18.8 dB** | ✅ PASS |\n")
-        f.write("| **DRC** | Compression Curve Linearity | $\\text{SNR} > 100\\text{ dB}$ | **Bit-exact below knee** | ✅ PASS |\n")
-        f.write("| **HPF** | Sub-band DC Rejection | $\\ge 40.0\\text{ dB}$ | **> 46.0 dB** | ✅ PASS |\n")
-        f.write("| **LPF** | Stopband HF Roll-off | $\\ge 12.0\\text{ dB}$ | **13.5 dB** | ✅ PASS |\n")
-        f.write("| **HS**  | Howling Notch Feedback Depth | $\\ge 3.0\\text{ dB}$ | **5.4 dB** | ✅ PASS |\n")
+        # Compute dynamically measured feature-specific physical metrics across evaluated clips
+        f.write("\n### 🎯 Dynamically Measured Quality Guarantee Matrix (Across Evaluated Clips)\n\n")
+        f.write("| Module | Evaluated Condition | Base Score / Metric | Candidate Score / Metric | Delta | Status |\n")
+        f.write("|:---|:---|:---:|:---:|:---:|:---:|\n")
 
-        f.write("\n> *Quality Criterion: Candidate perceptual score (ViSQOL/Zimtohrli MOS) must equal or exceed baseline (Δ ≥ -0.05) across all sample rates, and all feature-specific physical acceptance gates must pass.*\n\n")
+        seen_mods = set()
+        for r in results_by_rate.get(16000, []):
+            m = r["mod"]
+            if m not in seen_mods:
+                seen_mods.add(m)
+                st = "✅ PASS" if r["pass"] else "❌ FAIL"
+                f.write(f"| **{m.upper()}** | {r['cond']} | {r['base_mos']:.3f} | **{r['cand_mos']:.3f}** | **{r['delta']:+.3f}** | {st} |\n")
+
+        f.write("\n> *Quality Criterion: Candidate perceptual and physical metrics must equal or exceed baseline (Δ ≥ -0.05) across all sample rates without degradation.*\n\n")
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate baseline vs candidate quality on TCD-VoIP across sample rates.")

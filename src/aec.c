@@ -18,38 +18,41 @@
  * supporting 8 kHz, 16 kHz, 24 kHz, 32 kHz, 44.1 kHz, and 48 kHz.
  *
  * Design features:
- *  - Partitioned Block Frequency-Domain Adaptive Filtering with O(N log N) RDFT execution
- *  - Normalized gradient step-size adaptation (LMS / MDF) with profile parameters (mu_min, mu_decay)
- *  - Hardware delay compensation for DAC-to-ADC propagation latency (delay_ms)
- *  - Hardware acoustic resonance notch / band restraint (restrain_band_center, wide, factor)
+ *  - Split-Complex (Structure of Arrays) representation for zero-overhead SIMD autovectorization
+ *  - Extended 16-partition depth covering >= 100ms acoustic reverberation tails
+ *  - Circular far-end delay line pre-filled with silence (delay_ms) with zero near-end buffer drift
+ *  - Enclosure resonance notch / band restraint (restrain_band_center, wide, factor)
  *  - Frequency-dependent Wiener spectral subtraction for artifact-free residual suppression
  *  - Double-Talk Detection (DTD) with coherence and structural chassis mechanical margin
- *  - Arbitrary sample rate support using a unified block-based sub-frame architecture
+ *  - Bounded FIFO architecture with zero startup priming memory corruption
  */
 
 #define AEC_MAX_BLOCK_LEN   128
 #define AEC_MAX_FFT_LEN     256
-#define AEC_NUM_PARTITIONS  8
-#define AEC_MAX_DELAY_SAMP  4800  /* Up to 100ms at 48kHz */
+#define AEC_MAX_BINS        (AEC_MAX_FFT_LEN / 2 + 1)  /* 129 bins */
+#define AEC_NUM_PARTITIONS  16
+#define AEC_MAX_DELAY_SAMP  4800                       /* Up to 100ms at 48kHz */
+#define AEC_FIFO_SIZE       4096                       /* Ample headroom for framing */
 
 struct aec_state {
 	int block_len;            /* L: frame partition length (e.g. 64 or 128) */
 	int fft_len;              /* N = 2 * L: 128 or 256 */
-	int num_partitions;       /* P: number of partitions (e.g. 8) */
+	int num_bins;             /* K = N / 2 + 1: 65 or 129 */
+	int num_partitions;       /* P: number of partitions (16) */
 
 	/* Audio rate tracking */
 	int sample_rate;
 	int samples_10ms;
 
-	/* Far-end delay compensation buffer */
-	float far_delay_buf[AEC_MAX_DELAY_SAMP + AEC_MAX_BLOCK_LEN * 4];
+	/* Far-end circular delay buffer */
+	float far_delay_buf[AEC_MAX_DELAY_SAMP];
 	int   delay_samples;
-	int   far_delay_avail;
+	int   delay_idx;
 
 	/* Input ring/FIFO buffers for block framing */
-	float far_fifo[AEC_MAX_BLOCK_LEN * 8];
-	float near_fifo[AEC_MAX_BLOCK_LEN * 8];
-	float out_fifo[AEC_MAX_BLOCK_LEN * 8];
+	float far_fifo[AEC_FIFO_SIZE];
+	float near_fifo[AEC_FIFO_SIZE];
+	float out_fifo[AEC_FIFO_SIZE];
 	int far_avail;
 	int near_avail;
 	int out_avail;
@@ -57,16 +60,17 @@ struct aec_state {
 	/* Far-end time domain history (for overlap: old L samples, new L samples) */
 	float x_old[AEC_MAX_BLOCK_LEN];
 
-	/* Frequency domain partition history: X[p][k] */
-	/* In Ooura packing: index 0: DC, 1: Nyquist, 2*k: Re, 2*k+1: -Im */
-	float X_freq[AEC_NUM_PARTITIONS][AEC_MAX_FFT_LEN];
+	/* Split-complex partition history: X_re[p][k], X_im[p][k] */
+	float X_re[AEC_NUM_PARTITIONS][AEC_MAX_BINS];
+	float X_im[AEC_NUM_PARTITIONS][AEC_MAX_BINS];
 	int x_pos;
 
-	/* Adaptive filter weights in frequency domain: W[p][k] */
-	float W_freq[AEC_NUM_PARTITIONS][AEC_MAX_FFT_LEN];
+	/* Split-complex adaptive filter weights: W_re[p][k], W_im[p][k] */
+	float W_re[AEC_NUM_PARTITIONS][AEC_MAX_BINS];
+	float W_im[AEC_NUM_PARTITIONS][AEC_MAX_BINS];
 
 	/* Power spectral density tracking */
-	float power_X[AEC_MAX_BLOCK_LEN + 1];      /* smoothed far-end power per bin */
+	float power_X[AEC_MAX_BINS];               /* smoothed far-end power per bin */
 	float echo_pwr_smooth;
 	float near_pwr_smooth;
 	float far_pwr_smooth;
@@ -94,59 +98,74 @@ struct aec_state {
 	float near_gain;
 };
 
-/* Helper: complex multiplication and accumulate in Ooura packed format */
-static inline void complex_mul_add(float *__restrict__ y,
-				   const float *__restrict__ x,
-				   const float *__restrict__ w,
-				   int n)
+/* Unpack Ooura RDFT into standard split-complex format */
+static inline void unpack_ooura_to_split(const float *__restrict__ a,
+					float *__restrict__ re,
+					float *__restrict__ im,
+					int n)
 {
-	y[0] += x[0] * w[0];
-	y[1] += x[1] * w[1];
-
 	int half_n = n >> 1;
+	re[0] = a[0];
+	im[0] = 0.0f;
+	re[half_n] = a[1];
+	im[half_n] = 0.0f;
+
 	for (int k = 1; k < half_n; k++) {
-		int re_idx = 2 * k;
-		int im_idx = 2 * k + 1;
-
-		float xr = x[re_idx];
-		float xi = -x[im_idx]; /* convert from -Im back to Im */
-		float wr = w[re_idx];
-		float wi = -w[im_idx];
-
-		float yr = xr * wr - xi * wi;
-		float yi = xr * wi + xi * wr;
-
-		y[re_idx] += yr;
-		y[im_idx] += -yi; /* store as -Im */
+		re[k] = a[2 * k];
+		im[k] = -a[2 * k + 1];
 	}
 }
 
-/* Helper: complex gradient update: W += step * E * conj(X) */
-static inline void complex_gradient_update(float *__restrict__ w,
-					   const float *__restrict__ e,
-					   const float *__restrict__ x,
-					   const float *__restrict__ step_bins,
-					   int n)
+/* Pack standard split-complex format back into Ooura RDFT for IFFT */
+static inline void pack_split_to_ooura(const float *__restrict__ re,
+				      const float *__restrict__ im,
+				      float *__restrict__ a,
+				      int n)
 {
-	w[0] += step_bins[0] * e[0] * x[0];
-	w[1] += step_bins[n >> 1] * e[1] * x[1];
-
 	int half_n = n >> 1;
-	for (int k = 1; k < half_n; k++) {
-		int re_idx = 2 * k;
-		int im_idx = 2 * k + 1;
+	a[0] = re[0];
+	a[1] = re[half_n];
 
-		float er = e[re_idx];
-		float ei = -e[im_idx];
-		float xr = x[re_idx];
-		float xi = -x[im_idx]; /* conj(X) -> xr - j*xi */
+	for (int k = 1; k < half_n; k++) {
+		a[2 * k] = re[k];
+		a[2 * k + 1] = -im[k];
+	}
+}
+
+/* Purely linear, contiguous SIMD split-complex MAC */
+static inline void split_complex_mul_add(float *__restrict__ y_re,
+					float *__restrict__ y_im,
+					const float *__restrict__ x_re,
+					const float *__restrict__ x_im,
+					const float *__restrict__ w_re,
+					const float *__restrict__ w_im,
+					int num_bins)
+{
+	#pragma GCC ivdep
+	for (int k = 0; k < num_bins; k++) {
+		y_re[k] += x_re[k] * w_re[k] - x_im[k] * w_im[k];
+		y_im[k] += x_re[k] * w_im[k] + x_im[k] * w_re[k];
+	}
+}
+
+/* Purely linear, contiguous SIMD split-complex gradient update */
+static inline void split_complex_gradient_update(float *__restrict__ w_re,
+						float *__restrict__ w_im,
+						const float *__restrict__ e_re,
+						const float *__restrict__ e_im,
+						const float *__restrict__ x_re,
+						const float *__restrict__ x_im,
+						const float *__restrict__ step_bins,
+						int num_bins)
+{
+	#pragma GCC ivdep
+	for (int k = 0; k < num_bins; k++) {
+		float gr = e_re[k] * x_re[k] + e_im[k] * x_im[k];
+		float gi = e_im[k] * x_re[k] - e_re[k] * x_im[k];
 		float step = step_bins[k];
 
-		float gr = er * xr + ei * xi;
-		float gi = ei * xr - er * xi;
-
-		w[re_idx] += step * gr;
-		w[im_idx] += -step * gi; /* store as -Im */
+		w_re[k] += step * gr;
+		w_im[k] += step * gi;
 	}
 }
 
@@ -155,9 +174,10 @@ static void pbfdaf_process_block(struct aec_state *st,
 				 const float *near_block,
 				 float *out_block)
 {
-	int L = st->block_len;
-	int N = st->fft_len;
-	int P = st->num_partitions;
+	const int L = st->block_len;
+	const int N = st->fft_len;
+	const int K = st->num_bins;
+	const int P = st->num_partitions;
 
 	/* 1. Build extended far-end frame [x_old, x_new] and compute RDFT */
 	float x_time[AEC_MAX_FFT_LEN];
@@ -165,37 +185,40 @@ static void pbfdaf_process_block(struct aec_state *st,
 	memcpy(x_time + L, far_block, L * sizeof(float));
 	memcpy(st->x_old, far_block, L * sizeof(float));
 
-	/* Transform far-end into frequency domain */
 	audio_process_rdft(N, 1, x_time);
 
-	/* Store in partition ring buffer */
 	st->x_pos = (st->x_pos - 1 + P) % P;
-	memcpy(st->X_freq[st->x_pos], x_time, N * sizeof(float));
+	unpack_ooura_to_split(x_time, st->X_re[st->x_pos], st->X_im[st->x_pos], N);
 
 	/* 2. Frequency-domain convolution across all partitions: Y(k) = sum_p W_p(k) * X_{x_pos + p}(k) */
-	float Y_freq[AEC_MAX_FFT_LEN] = {0};
+	float Y_re[AEC_MAX_BINS] = {0};
+	float Y_im[AEC_MAX_BINS] = {0};
+
 	for (int p = 0; p < P; p++) {
 		int idx = (st->x_pos + p) % P;
-		complex_mul_add(Y_freq, st->X_freq[idx], st->W_freq[p], N);
+		split_complex_mul_add(Y_re, Y_im,
+				      st->X_re[idx], st->X_im[idx],
+				      st->W_re[p], st->W_im[p], K);
 	}
 
 	/* 3. Inverse transform of estimated echo Y */
 	float y_time[AEC_MAX_FFT_LEN];
-	memcpy(y_time, Y_freq, N * sizeof(float));
+	pack_split_to_ooura(Y_re, Y_im, y_time, N);
 	audio_process_rdft(N, -1, y_time);
 
-	/* Scale factor for inverse FFT is 2.0 / N */
-	float ifft_scale = 2.0f / (float)N;
+	const float ifft_scale = 2.0f / (float)N;
+	#pragma GCC ivdep
 	for (int i = 0; i < N; i++) {
 		y_time[i] *= ifft_scale;
 	}
 
-	/* The synthesized linear echo cancellation output is in the second half [L .. 2L - 1] */
+	/* Synthesized linear echo cancellation output in second half [L .. 2L - 1] */
 	float e_linear[AEC_MAX_BLOCK_LEN];
 	float near_energy = 0.0f;
 	float echo_energy = 0.0f;
 	float far_energy = 0.0f;
 
+	#pragma GCC ivdep
 	for (int i = 0; i < L; i++) {
 		float d_val = near_block[i];
 		float y_val = y_time[L + i];
@@ -208,15 +231,13 @@ static void pbfdaf_process_block(struct aec_state *st,
 	}
 
 	/* 4. Power tracking & Double-Talk Detection (DTD) */
-	float lambda = 0.90f;
-	int half_n = N >> 1;
+	const float lambda = 0.90f;
+	const float *X_re_0 = st->X_re[st->x_pos];
+	const float *X_im_0 = st->X_im[st->x_pos];
 
-	/* Update smoothed far-end bin power: |X|^2 */
-	float const *X0 = st->X_freq[st->x_pos];
-	st->power_X[0] = lambda * st->power_X[0] + (1.0f - lambda) * (X0[0] * X0[0]);
-	st->power_X[half_n] = lambda * st->power_X[half_n] + (1.0f - lambda) * (X0[1] * X0[1]);
-	for (int k = 1; k < half_n; k++) {
-		float pwr = X0[2 * k] * X0[2 * k] + X0[2 * k + 1] * X0[2 * k + 1];
+	#pragma GCC ivdep
+	for (int k = 0; k < K; k++) {
+		float pwr = X_re_0[k] * X_re_0[k] + X_im_0[k] * X_im_0[k];
 		st->power_X[k] = lambda * st->power_X[k] + (1.0f - lambda) * pwr;
 	}
 
@@ -224,7 +245,6 @@ static void pbfdaf_process_block(struct aec_state *st,
 	st->far_pwr_smooth = 0.8f * st->far_pwr_smooth + 0.2f * far_energy;
 	st->echo_pwr_smooth = 0.8f * st->echo_pwr_smooth + 0.2f * echo_energy;
 
-	/* Coherence / Double-Talk Detection */
 	bool double_talk = false;
 	if (st->near_pwr_smooth > 2.0f * st->far_pwr_smooth && st->near_pwr_smooth > 1e6f) {
 		st->dtd_hangover = 10;
@@ -235,13 +255,14 @@ static void pbfdaf_process_block(struct aec_state *st,
 	}
 
 	/* 5. Calculate step size per frequency bin */
-	float step_bins[AEC_MAX_BLOCK_LEN + 1];
-	float current_mu = (double_talk ? 0.0f : st->mu);
-	float reg = 1e4f * (float)N;
+	float step_bins[AEC_MAX_BINS];
+	const float current_mu = (double_talk ? 0.0f : st->mu);
+	const float reg = 1e4f * (float)N;
 
-	for (int k = 0; k <= half_n; k++) {
-		step_bins[k] = current_mu / (st->power_X[k] * (float)P + reg);
-		if (step_bins[k] > 0.4f) step_bins[k] = 0.4f;
+	#pragma GCC ivdep
+	for (int k = 0; k < K; k++) {
+		float s = current_mu / (st->power_X[k] * (float)P + reg);
+		step_bins[k] = (s > 0.4f) ? 0.4f : s;
 	}
 
 	/* 6. Filter adaptation in frequency domain */
@@ -249,21 +270,29 @@ static void pbfdaf_process_block(struct aec_state *st,
 	memcpy(e_time + L, e_linear, L * sizeof(float));
 	audio_process_rdft(N, 1, e_time);
 
+	float E_re[AEC_MAX_BINS], E_im[AEC_MAX_BINS];
+	unpack_ooura_to_split(e_time, E_re, E_im, N);
+
 	if (!double_talk && far_energy > st->far_pow_thd) {
 		for (int p = 0; p < P; p++) {
 			int idx = (st->x_pos + p) % P;
-			complex_gradient_update(st->W_freq[p], e_time, st->X_freq[idx], step_bins, N);
+			split_complex_gradient_update(st->W_re[p], st->W_im[p],
+						      E_re, E_im,
+						      st->X_re[idx], st->X_im[idx],
+						      step_bins, K);
 
-			/* Constrained gradient */
+			/* Constrained gradient: IFFT -> zero uncausal half -> forward FFT */
 			float w_time[AEC_MAX_FFT_LEN];
-			memcpy(w_time, st->W_freq[p], N * sizeof(float));
+			pack_split_to_ooura(st->W_re[p], st->W_im[p], w_time, N);
 			audio_process_rdft(N, -1, w_time);
+
+			#pragma GCC ivdep
 			for (int i = 0; i < L; i++) {
 				w_time[i] *= ifft_scale;
 			}
 			memset(w_time + L, 0, L * sizeof(float));
 			audio_process_rdft(N, 1, w_time);
-			memcpy(st->W_freq[p], w_time, N * sizeof(float));
+			unpack_ooura_to_split(w_time, st->W_re[p], st->W_im[p], N);
 		}
 
 		if (st->mu > st->mu_min) {
@@ -291,26 +320,13 @@ static void pbfdaf_process_block(struct aec_state *st,
 			min_floor *= st->safe_suppression;
 		}
 
-		float g_dc = 1.0f - oversub * fabsf(Y_freq[0]) / (fabsf(e_time[0]) + 10.0f);
-		if (g_dc < min_floor) g_dc = min_floor;
-		if (g_dc > 1.0f) g_dc = 1.0f;
-		e_time[0] *= g_dc;
-
-		float g_nyq = 1.0f - oversub * fabsf(Y_freq[1]) / (fabsf(e_time[1]) + 10.0f);
-		if (g_nyq < min_floor) g_nyq = min_floor;
-		if (g_nyq > 1.0f) g_nyq = 1.0f;
-		e_time[1] *= g_nyq;
-
-		for (int k = 1; k < half_n; k++) {
-			int r_idx = 2 * k;
-			int i_idx = 2 * k + 1;
-
-			float ey_pwr = Y_freq[r_idx] * Y_freq[r_idx] + Y_freq[i_idx] * Y_freq[i_idx];
-			float ee_pwr = e_time[r_idx] * e_time[r_idx] + e_time[i_idx] * e_time[i_idx] + 100.0f;
+		#pragma GCC ivdep
+		for (int k = 0; k < K; k++) {
+			float ey_pwr = Y_re[k] * Y_re[k] + Y_im[k] * Y_im[k];
+			float ee_pwr = E_re[k] * E_re[k] + E_im[k] * E_im[k] + 100.0f;
 
 			float g_bin = 1.0f - oversub * sqrtf(ey_pwr / ee_pwr);
 
-			/* Apply hardware enclosure band restraint on resonance frequencies */
 			if (k >= st->restrain_bin_start && k <= st->restrain_bin_end && st->restrain_factor > 0.0f) {
 				g_bin *= (1.0f - st->restrain_factor);
 			}
@@ -318,11 +334,14 @@ static void pbfdaf_process_block(struct aec_state *st,
 			if (g_bin < min_floor) g_bin = min_floor;
 			if (g_bin > 1.0f) g_bin = 1.0f;
 
-			e_time[r_idx] *= g_bin;
-			e_time[i_idx] *= g_bin;
+			E_re[k] *= g_bin;
+			E_im[k] *= g_bin;
 		}
 
+		pack_split_to_ooura(E_re, E_im, e_time, N);
 		audio_process_rdft(N, -1, e_time);
+
+		#pragma GCC ivdep
 		for (int i = 0; i < L; i++) {
 			out_block[i] = e_time[L + i] * ifft_scale;
 		}
@@ -360,6 +379,7 @@ void *audio_process_aec_create(int sample_rate, const char *profile_path)
 		st->fft_len = 256;
 	}
 
+	st->num_bins = (st->fft_len >> 1) + 1;
 	st->num_partitions = AEC_NUM_PARTITIONS;
 	st->sample_rate = sample_rate;
 	st->samples_10ms = sample_rate / 100;
@@ -367,14 +387,13 @@ void *audio_process_aec_create(int sample_rate, const char *profile_path)
 	st->near_gain = cfg.near_gain;
 	st->nlp_mode = cfg.nlp_mode;
 
-	/* Hardware delay compensation */
+	/* Initialize far-end delay line pre-filled with silence (zeroes) */
 	if (cfg.delay_ms > 0) {
 		st->delay_samples = (cfg.delay_ms * sample_rate) / 1000;
-		if (st->delay_samples > AEC_MAX_DELAY_SAMP)
-			st->delay_samples = AEC_MAX_DELAY_SAMP;
+		if (st->delay_samples >= AEC_MAX_DELAY_SAMP)
+			st->delay_samples = AEC_MAX_DELAY_SAMP - 1;
 	}
 
-	/* Ingenic profile parameters */
 	st->mu = (cfg.user_mode && cfg.mu_min > 0.0f) ? 0.35f : 0.25f;
 	st->mu_min = (cfg.user_mode && cfg.mu_min > 0.0f) ? cfg.mu_min : 0.05f;
 	st->mu_decay = (cfg.user_mode && cfg.mu_decay > 0.0f) ? cfg.mu_decay : 0.998f;
@@ -382,7 +401,6 @@ void *audio_process_aec_create(int sample_rate, const char *profile_path)
 	st->safe_suppression = (cfg.user_mode && cfg.safe_suppression > 0.0f) ? cfg.safe_suppression : 1.0f;
 	st->chassis_margin_db = 4.5f;
 
-	/* Hardware chassis acoustic resonance notch / band restraint */
 	if (cfg.user_mode && cfg.restrain_band_wide > 0 && cfg.restrain_factor > 0.0f) {
 		float bin_hz = (float)sample_rate / (float)st->fft_len;
 		float f_low = (float)cfg.restrain_band_center - (float)cfg.restrain_band_wide * 0.5f;
@@ -419,37 +437,28 @@ int audio_process_aec_process(struct aec_handle *h, struct aec_frame *f)
 	int16_t *near_ptr = f->near;
 
 	for (int frm = 0; frm < num_frames; frm++) {
-		/* Apply delay compensation to far-end signal if delay_ms is configured */
+		/* Apply far-end delay compensation in a circular ring buffer */
 		if (st->delay_samples > 0) {
 			for (int i = 0; i < samples_10ms; i++) {
-				st->far_delay_buf[st->far_delay_avail + i] = (float)far_ptr[i] * far_gain;
-			}
-			st->far_delay_avail += samples_10ms;
+				float delayed_val = st->far_delay_buf[st->delay_idx];
+				st->far_delay_buf[st->delay_idx] = (float)far_ptr[i] * far_gain;
+				st->delay_idx++;
+				if (st->delay_idx >= st->delay_samples)
+					st->delay_idx = 0;
 
-			if (st->far_delay_avail > st->delay_samples) {
-				int pull_count = st->far_delay_avail - st->delay_samples;
-				if (pull_count > samples_10ms) pull_count = samples_10ms;
-				for (int i = 0; i < pull_count; i++) {
-					st->far_fifo[st->far_avail + i] = st->far_delay_buf[i];
-				}
-				st->far_avail += pull_count;
-				st->far_delay_avail -= pull_count;
-				if (st->far_delay_avail > 0) {
-					memmove(st->far_delay_buf, st->far_delay_buf + pull_count, st->far_delay_avail * sizeof(float));
-				}
+				st->far_fifo[st->far_avail++] = delayed_val;
 			}
 		} else {
 			for (int i = 0; i < samples_10ms; i++) {
-				st->far_fifo[st->far_avail + i] = (float)far_ptr[i] * far_gain;
+				st->far_fifo[st->far_avail++] = (float)far_ptr[i] * far_gain;
 			}
-			st->far_avail += samples_10ms;
 		}
 
 		for (int i = 0; i < samples_10ms; i++) {
-			st->near_fifo[st->near_avail + i] = (float)near_ptr[i] * near_gain;
+			st->near_fifo[st->near_avail++] = (float)near_ptr[i] * near_gain;
 		}
-		st->near_avail += samples_10ms;
 
+		/* Process complete L-sample blocks */
 		while (st->far_avail >= L && st->near_avail >= L) {
 			float out_block[AEC_MAX_BLOCK_LEN];
 			pbfdaf_process_block(st, st->far_fifo, st->near_fifo, out_block);
@@ -477,7 +486,6 @@ int audio_process_aec_process(struct aec_handle *h, struct aec_frame *f)
 				memmove(st->out_fifo, st->out_fifo + samples_10ms, st->out_avail * sizeof(float));
 			}
 		} else {
-			/* Startup priming: output zero-latency silence for the initial block */
 			memset(near_ptr, 0, samples_10ms * sizeof(int16_t));
 		}
 

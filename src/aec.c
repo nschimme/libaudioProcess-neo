@@ -83,18 +83,20 @@ int audio_process_aec_process(struct aec_handle *h, struct aec_frame *f)
 	float near_f[MAX_SAMPLES_10MS];
 	float out_f[MAX_SAMPLES_10MS];
 
-	for (int i = 0; i < num_frames; i++) {
-		int offset = i * (bytes_per_10ms / 2);
-		const int16_t *far_ptr = f->far + offset;
-		int16_t *near_ptr = f->near + offset;
+	const float far_gain = h->far_gain;
+	const float near_gain = h->near_gain;
+	const int samples_per_frame = bytes_per_10ms / 2;
+	const int16_t *far_ptr = f->far;
+	int16_t *near_ptr = f->near;
 
+	for (int i = 0; i < num_frames; i++) {
 		for (int j = 0; j < samples_10ms; j++)
-			far_f[j] = (float)far_ptr[j] * h->far_gain;
+			far_f[j] = (float)far_ptr[j] * far_gain;
 
 		WebRtcAec_BufferFarend(h->aec, far_f, (size_t)samples_10ms);
 
 		for (int j = 0; j < samples_10ms; j++)
-			near_f[j] = (float)near_ptr[j] * h->near_gain;
+			near_f[j] = (float)near_ptr[j] * near_gain;
 
 		const float *near_pp = near_f;
 		float *out_pp = out_f;
@@ -103,6 +105,9 @@ int audio_process_aec_process(struct aec_handle *h, struct aec_frame *f)
 
 		for (int j = 0; j < samples_10ms; j++)
 			near_ptr[j] = clamp_i16(out_f[j]);
+
+		far_ptr += samples_per_frame;
+		near_ptr += samples_per_frame;
 	}
 
 	return 0;

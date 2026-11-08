@@ -27,10 +27,13 @@ struct hd_state {
 	float spectrum[HD_HALF_FFT];
 	int persist[HD_HALF_FFT];
 
-	/* detection thresholds (dB) */
+	/* detection thresholds (dB and linear factors) */
 	float ptpr_thr;
 	float papr_thr;
 	float pnpr_thr;
+	float ptpr_lin;
+	float papr_lin;
+	float pnpr_lin;
 
 	/* notch filters */
 	struct biquad notches[HD_MAX_NOTCHES];
@@ -51,45 +54,63 @@ static void hd_init_window(float *w, int n)
 
 static void hd_compute_spectrum(struct hd_state *s, const int16_t *frame)
 {
-	for (int i = 0; i < HD_FFT_SIZE; i++)
-		s->fft_buf[i] = (float)frame[i] * s->window[i];
+	float * __restrict__ fft_buf = s->fft_buf;
+	const float * __restrict__ window = s->window;
+	const int16_t * __restrict__ frm = frame;
 
-	WebRtc_rdft(HD_FFT_SIZE, 1, s->fft_buf, s->fft_ip, s->fft_w);
+	/* Unroll 4x for vector-pipeline parallelism */
+	for (int i = 0; i < HD_FFT_SIZE; i += 4) {
+		fft_buf[i + 0] = (float)frm[i + 0] * window[i + 0];
+		fft_buf[i + 1] = (float)frm[i + 1] * window[i + 1];
+		fft_buf[i + 2] = (float)frm[i + 2] * window[i + 2];
+		fft_buf[i + 3] = (float)frm[i + 3] * window[i + 3];
+	}
 
-	s->spectrum[0] = fabsf(s->fft_buf[0]);
+	WebRtc_rdft(HD_FFT_SIZE, 1, fft_buf, s->fft_ip, s->fft_w);
+
+	float * __restrict__ spectrum = s->spectrum;
+	spectrum[0] = fabsf(fft_buf[0]);
 	for (int k = 1; k < HD_HALF_FFT; k++) {
-		float re = s->fft_buf[2 * k];
-		float im = s->fft_buf[2 * k + 1];
-		s->spectrum[k] = sqrtf(re * re + im * im);
+		float re = fft_buf[2 * k];
+		float im = fft_buf[2 * k + 1];
+		spectrum[k] = sqrtf(re * re + im * im);
 	}
 }
 
 static int hd_detect_candidates(struct hd_state *s, int *candidates)
 {
+	const float *spectrum = s->spectrum;
 	float avg = 0.0f;
 	for (int k = 0; k < HD_HALF_FFT; k++)
-		avg += s->spectrum[k];
-	avg /= HD_HALF_FFT;
+		avg += spectrum[k];
+	avg *= (1.0f / (float)HD_HALF_FFT);
 	if (avg < 1e-10f)
 		avg = 1e-10f;
 
+	const float ptpr_lin = s->ptpr_lin;
+	const float papr_threshold = avg * s->papr_lin;
+	const float pnpr_lin = s->pnpr_lin;
+
 	int num = 0;
 	for (int k = 5; k < HD_HALF_FFT - 6; k++) {
-		float mag = s->spectrum[k];
+		float mag = spectrum[k];
 		if (mag < 1e-10f)
 			continue;
 
-		if (20.0f * log10f(mag) < s->ptpr_thr)
+		/* 20*log10(mag) < ptpr_thr <=> mag < 10^(ptpr_thr/20) */
+		if (mag < ptpr_lin)
 			continue;
-		if (20.0f * log10f(mag / avg) < s->papr_thr)
+		/* 20*log10(mag/avg) < papr_thr <=> mag < avg * 10^(papr_thr/20) */
+		if (mag < papr_threshold)
 			continue;
 
 		int pass = 1;
 		for (int n = 0; n < PNPR_NUM_CHECKS && pass; n++) {
-			float neighbor = s->spectrum[k + pnpr_offsets[n]];
+			float neighbor = spectrum[k + pnpr_offsets[n]];
 			if (neighbor < 1e-10f)
 				neighbor = 1e-10f;
-			if (20.0f * log10f(mag / neighbor) < s->pnpr_thr)
+			/* 20*log10(mag/neighbor) < pnpr_thr <=> mag < neighbor * 10^(pnpr_thr/20) */
+			if (mag < neighbor * pnpr_lin)
 				pass = 0;
 		}
 
@@ -157,6 +178,9 @@ void *audio_process_hs_create(int sample_rate, int frame_size)
 	s->ptpr_thr = 30.0f;
 	s->papr_thr = 15.0f;
 	s->pnpr_thr = 10.0f;
+	s->ptpr_lin = powf(10.0f, s->ptpr_thr / 20.0f);
+	s->papr_lin = powf(10.0f, s->papr_thr / 20.0f);
+	s->pnpr_lin = powf(10.0f, s->pnpr_thr / 20.0f);
 
 	hd_init_window(s->window, HD_FFT_SIZE);
 
@@ -182,19 +206,18 @@ void audio_process_hs_process(void *handle, int16_t *data, int num_samples)
 		hd_update_persistence(s, candidates, num_cand);
 		hd_update_notches(s);
 
+		const float inv_crossfade = 1.0f / (float)HD_CROSSFADE;
 		for (int i = 0; i < s->num_notches; i++) {
-			for (int j = 0; j < HD_FFT_SIZE; j++) {
-				int16_t filtered = biquad_process_i16(
-					&s->notches[i], frame[j]);
-				if (j < HD_CROSSFADE) {
-					float t = (float)j / HD_CROSSFADE;
-					frame[j] = (int16_t)(
-						(1.0f - t) * (float)frame[j] +
-						t * (float)filtered);
-				} else {
-					frame[j] = filtered;
-				}
+			struct biquad *notch = &s->notches[i];
+			/* Crossfade portion: first HD_CROSSFADE samples */
+			for (int j = 0; j < HD_CROSSFADE; j++) {
+				int16_t filtered = biquad_process_i16(notch, frame[j]);
+				float t = (float)j * inv_crossfade;
+				frame[j] = (int16_t)((1.0f - t) * (float)frame[j] + t * (float)filtered);
 			}
+			/* Remaining steady-state samples: use block processing directly */
+			biquad_process_block_i16(notch, frame + HD_CROSSFADE, frame + HD_CROSSFADE,
+						 HD_FFT_SIZE - HD_CROSSFADE);
 		}
 	}
 }

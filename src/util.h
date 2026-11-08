@@ -10,14 +10,13 @@ static inline int16_t clamp_i16(float v)
 		return 32767;
 	if (v < -32768.0f)
 		return -32768;
-	return (int16_t)v;
+	return (int16_t)(int32_t)v;
 }
 
 static inline float clamp_f(float v, float lo, float hi)
 {
-	if (v < lo) return lo;
-	if (v > hi) return hi;
-	return v;
+	v = (v < lo) ? lo : v;
+	return (v > hi) ? hi : v;
 }
 
 #endif

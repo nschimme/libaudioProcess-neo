@@ -665,7 +665,7 @@ int main(int argc, char **argv)
 			fprintf(fsum, "| Module | Baseline Throughput | Candidate Throughput | Speedup | Quality / Diff |\n");
 			fprintf(fsum, "|:---|:---:|:---:|:---:|:---:|\n");
 			for (int e = 0; e < g_num_entries; e++) {
-				fprintf(fsum, "| **%s** | %.2f MS/s | **%.2f MS/s** | **%+5.1f%%** | %s |\n",
+				fprintf(fsum, "| **%s** | %.2f MS/s | **%.2f MS/s** | **%+.1f%%** | %s |\n",
 					g_entries[e].module, g_entries[e].mss_base, g_entries[e].mss_cand,
 					g_entries[e].speedup, g_entries[e].quality);
 			}

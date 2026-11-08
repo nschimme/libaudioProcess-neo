@@ -87,6 +87,10 @@ struct lib_api {
 	fn_aec_free aec_free;
 };
 
+/* Provide symbol fallback if evaluating legacy WebRTC baseline shared libraries on x86 host */
+int WebRtc_GetCPUInfo(int feature) { (void)feature; return 0; }
+int WebRtcAec_InitAec_SSE2(void) { return 0; }
+
 static int load_api(const char *path, struct lib_api *api)
 {
 	/* Pre-load libm with RTLD_GLOBAL to resolve math symbols on libraries

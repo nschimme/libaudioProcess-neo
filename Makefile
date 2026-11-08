@@ -23,10 +23,8 @@ MOD_SRC = $(addprefix $(SRCDIR)/, \
 	aec.c agc.c ns.c hpf.c lpf.c \
 	howling.c drc.c eq.c drc_eq.c biquad.c config.c fft.c)
 
-# WebRTC AEC (Replaced aec_rdft with clean-room src/fft.c)
-AEC_SRC = $(addprefix $(SRCDIR)/webrtc/modules/audio_processing/aec/, \
-	aec_core.c aec_core_mips.c echo_cancellation.c \
-	aec_resampler.c)
+# WebRTC AEC (Replaced by clean-room src/aec.c and src/fft.c)
+AEC_SRC =
 
 # WebRTC AGC (Replaced by clean-room src/agc.c)
 AGC_SRC =
@@ -95,7 +93,7 @@ size: $(TARGET)
 	@nm -D --defined-only $(TARGET) | grep -c ' T '
 
 test:
-	gcc -std=c11 -D_GNU_SOURCE -O2 -rdynamic -Isrc src/agc.c src/biquad.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/fft.c src/webrtc/common_audio/signal_processing/copy_set_operations.c tests/unit_tests.c -ldl -lm -o tests/unit_tests_bin
+	gcc -std=c11 -D_GNU_SOURCE -O2 -rdynamic -Isrc src/aec.c src/agc.c src/biquad.c src/config.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/fft.c src/webrtc/common_audio/signal_processing/copy_set_operations.c tests/unit_tests.c -ldl -lm -o tests/unit_tests_bin
 	./tests/unit_tests_bin
 	rm -f tests/unit_tests_bin
 

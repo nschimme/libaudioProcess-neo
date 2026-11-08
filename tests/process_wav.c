@@ -47,6 +47,10 @@ typedef void *(*fn_aec_create)(int, const char *);
 typedef int   (*fn_aec_process)(struct aec_handle *, struct aec_frame *);
 typedef int   (*fn_aec_free)(struct aec_handle *);
 
+/* Provide symbol fallback if evaluating legacy WebRTC baseline shared libraries on x86 host */
+int WebRtc_GetCPUInfo(int feature) { (void)feature; return 0; }
+int WebRtcAec_InitAec_SSE2(void) { return 0; }
+
 int main(int argc, char **argv)
 {
 	if (argc < 4) {

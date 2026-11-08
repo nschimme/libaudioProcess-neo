@@ -40,24 +40,16 @@ jobs:
           cd candidate
           make test
 
-      - name: Build & Run Native x86_64 Baseline vs Candidate Benchmark
+      - name: Build & Run Native x86_64 Benchmark
         run: |
-          # Build native candidate shared library
+          # Build native candidate shared library and benchmark tool
           cd candidate
           make clean
           make CROSS_COMPILE=
-          cp libaudioProcess.so ../libaudioProcess_candidate_native.so
           make bench
 
-          # Build native baseline shared library
-          cd ../baseline
-          make clean
-          make CROSS_COMPILE= CFLAGS="-std=c11 -D_GNU_SOURCE -Os -Wall -Wextra -Werror=implicit-function-declaration -fPIC -DWEBRTC_POSIX -Isrc -ffunction-sections -fdata-sections -flto -fno-asynchronous-unwind-tables -fmerge-all-constants -fno-ident"
-          cp libaudioProcess.so ../libaudioProcess_baseline_native.so
-
           # Execute native host throughput benchmark
-          cd ../candidate
-          ./tests/bench_bin ../libaudioProcess_baseline_native.so ../libaudioProcess_candidate_native.so
+          ./tests/bench_bin ./libaudioProcess.so ./libaudioProcess.so
 
       - name: Build MIPS Baseline Shared Library
         run: |

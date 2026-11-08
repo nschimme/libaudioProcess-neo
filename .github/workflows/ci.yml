@@ -40,6 +40,17 @@ jobs:
           cd candidate
           make test
 
+      - name: Build & Run Native x86_64 Benchmark
+        run: |
+          # Build native candidate shared library and benchmark tool
+          cd candidate
+          make clean
+          make CROSS_COMPILE=
+          make bench
+
+          # Execute native host throughput benchmark
+          ./tests/bench_bin ./libaudioProcess.so ./libaudioProcess.so
+
       - name: Build MIPS Baseline Shared Library
         run: |
           cd baseline

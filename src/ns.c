@@ -88,6 +88,18 @@ void *audio_process_ns_create(void)
 	return st;
 }
 
+/* Samples per call and band. The real caller (libimp) hands over 160-float band
+ * buffers (80 at 8 kHz) at 8/16/32/48 kHz, exactly as WebRTC's NS block length;
+ * 24/44.1 kHz are not used by libimp and keep a full-rate 10 ms band. */
+static int ns_band_len(int sample_rate)
+{
+	if (sample_rate == 8000)
+		return 80;
+	if (sample_rate == 16000 || sample_rate == 32000 || sample_rate == 48000)
+		return NS_BAND_LEN;
+	return sample_rate / 100;
+}
+
 /* (Re)initialise the analysis state for a given band length. */
 static void ns_setup(struct modern_ns_state *st, int frame_size)
 {
@@ -136,9 +148,7 @@ int audio_process_ns_set_config(void *ns, int sample_rate, int policy)
 
 	st->sample_rate = sample_rate > 0 ? sample_rate : 16000;
 	st->policy = policy;
-	/* Frame contract of the real caller (libimp): one mono band of 10 ms,
-	 * i.e. sample_rate / 100 samples, at every rate. */
-	ns_setup(st, st->sample_rate / 100);
+	ns_setup(st, ns_band_len(st->sample_rate));
 	return 0;
 }
 
@@ -153,13 +163,7 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 	if (!st || !in_bands || !*in_bands || !out_bands || !*out_bands || !num_bands)
 		return;
 
-	/* Two band layouts are honoured:
-	 *  - num_bands == 1: one band of sample_rate/100 samples (the libimp contract);
-	 *  - num_bands  > 1 at 32/48 kHz: WebRTC-style pre-split bands of 160 samples,
-	 *    where the low band is analysed at 16 kHz and the upper bands follow it. */
-	int want = st->sample_rate / 100;
-	if (num_bands > 1 && (st->sample_rate == 32000 || st->sample_rate == 48000))
-		want = NS_BAND_LEN;
+	int want = ns_band_len(st->sample_rate);
 	if (want != st->frame_size)
 		ns_setup(st, want);
 

@@ -389,16 +389,17 @@ static void test_ns_guardrails(void)
 	if (fn_ns_get_config) fn_ns_get_config();
 
 	/* Multi-rate & multi-policy guardrail verification */
-	/* Two band layouts are part of the contract:
-	 *  - one band of rate/100 samples at every rate (what libimp passes), and
-	 *  - WebRTC-style pre-split bands of 160 samples (2 at 32 kHz, 3 at 48 kHz). */
+	/* Frame contract (libimp hands over 160-float band buffers, 80 at 8 kHz):
+	 *  - one band per call at every rate, 160 samples (80 at 8 kHz; 24 kHz is an
+	 *    extension that keeps a full-rate 10 ms band of 240), and
+	 *  - WebRTC-style pre-split bands (2 at 32 kHz, 3 at 48 kHz), also 160 each. */
 	struct { int rate; int bands; } cases[] = {
 		{8000, 1}, {16000, 1}, {24000, 1}, {32000, 1}, {48000, 1}, {32000, 2}, {48000, 3}
 	};
 	for (int r = 0; r < 7; r++) {
 		int rate = cases[r].rate;
 		int num_bands = cases[r].bands;
-		int frame_len = (num_bands > 1) ? 160 : rate / 100;
+		int frame_len = (rate == 8000) ? 80 : (rate == 24000) ? 240 : 160;
 		float *in_f[3], *out_f[3];
 		const float *inp[3];
 		float *outp[3];

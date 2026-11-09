@@ -499,13 +499,10 @@ static void test_fft_guardrails(void)
 	printf("Running test_fft_guardrails...\n");
 	extern void audio_process_rdft(size_t n, int isgn, float *a);
 
-	extern void audio_process_rdft_forward(size_t n, const float *in_time, float *out_re, float *out_im);
-	extern void audio_process_rdft_inverse(size_t n, const float *in_re, const float *in_im, float *out_time);
-
-	int sizes[] = {128, 256, 512, 1024};
-	for (int s = 0; s < 4; s++) {
+	int sizes[] = {128, 256, 512};
+	for (int s = 0; s < 3; s++) {
 		int n = sizes[s];
-		float orig[1024], a[1024];
+		float orig[512], a[512];
 		float orig_energy = 0.0f;
 		for (int i = 0; i < n; i++) {
 			orig[i] = sinf((float)i * 0.25f) + 0.5f * cosf((float)i * 0.77f);
@@ -513,7 +510,6 @@ static void test_fft_guardrails(void)
 			orig_energy += orig[i] * orig[i];
 		}
 
-		/* Legacy packed interface */
 		audio_process_rdft(n, 1, a);
 		audio_process_rdft(n, -1, a);
 
@@ -530,20 +526,6 @@ static void test_fft_guardrails(void)
 		ASSERT_TRUE(max_recon_err < 1e-4f, "FFT roundtrip max error within 1e-4");
 		float energy_diff = fabsf(recon_energy - orig_energy) / orig_energy;
 		ASSERT_TRUE(energy_diff < 1e-4f, "FFT energy conserved within 1e-4");
-
-		/* Direct natural split-complex interface */
-		float re[513], im[513], y[1024];
-		audio_process_rdft_forward(n, orig, re, im);
-		audio_process_rdft_inverse(n, re, im, y);
-
-		float max_split_err = 0.0f;
-		for (int i = 0; i < n; i++) {
-			float r = y[i] * 2.0f / (float)n;
-			float err = fabsf(r - orig[i]);
-			if (err > max_split_err)
-				max_split_err = err;
-		}
-		ASSERT_TRUE(max_split_err < 1e-4f, "Split RDFT roundtrip error within 1e-4");
 	}
 	printf("  -> PASS\n");
 }

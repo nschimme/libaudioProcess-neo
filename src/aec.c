@@ -98,39 +98,6 @@ struct aec_state {
 	float near_gain;
 };
 
-/* Unpack Ooura RDFT into standard split-complex format */
-static inline void unpack_ooura_to_split(const float *__restrict__ a,
-					float *__restrict__ re,
-					float *__restrict__ im,
-					int n)
-{
-	int half_n = n >> 1;
-	re[0] = a[0];
-	im[0] = 0.0f;
-	re[half_n] = a[1];
-	im[half_n] = 0.0f;
-
-	for (int k = 1; k < half_n; k++) {
-		re[k] = a[2 * k];
-		im[k] = -a[2 * k + 1];
-	}
-}
-
-/* Pack standard split-complex format back into Ooura RDFT for IFFT */
-static inline void pack_split_to_ooura(const float *__restrict__ re,
-				      const float *__restrict__ im,
-				      float *__restrict__ a,
-				      int n)
-{
-	int half_n = n >> 1;
-	a[0] = re[0];
-	a[1] = re[half_n];
-
-	for (int k = 1; k < half_n; k++) {
-		a[2 * k] = re[k];
-		a[2 * k + 1] = -im[k];
-	}
-}
 
 /* Purely linear, contiguous SIMD split-complex MAC */
 static inline void split_complex_mul_add(float *__restrict__ y_re,
@@ -179,16 +146,14 @@ static void pbfdaf_process_block(struct aec_state *st,
 	const int K = st->num_bins;
 	const int P = st->num_partitions;
 
-	/* 1. Build extended far-end frame [x_old, x_new] and compute RDFT */
+	/* 1. Build extended far-end frame [x_old, x_new] and compute direct split RDFT */
 	float x_time[AEC_MAX_FFT_LEN];
 	memcpy(x_time, st->x_old, L * sizeof(float));
 	memcpy(x_time + L, far_block, L * sizeof(float));
 	memcpy(st->x_old, far_block, L * sizeof(float));
 
-	audio_process_rdft(N, 1, x_time);
-
 	st->x_pos = (st->x_pos - 1 + P) % P;
-	unpack_ooura_to_split(x_time, st->X_re[st->x_pos], st->X_im[st->x_pos], N);
+	audio_process_rdft_forward(N, x_time, st->X_re[st->x_pos], st->X_im[st->x_pos]);
 
 	/* 2. Frequency-domain convolution across all partitions: Y(k) = sum_p W_p(k) * X_{x_pos + p}(k) */
 	float Y_re[AEC_MAX_BINS] = {0};
@@ -201,10 +166,9 @@ static void pbfdaf_process_block(struct aec_state *st,
 				      st->W_re[p], st->W_im[p], K);
 	}
 
-	/* 3. Inverse transform of estimated echo Y */
+	/* 3. Inverse transform of estimated echo Y directly to time domain */
 	float y_time[AEC_MAX_FFT_LEN];
-	pack_split_to_ooura(Y_re, Y_im, y_time, N);
-	audio_process_rdft(N, -1, y_time);
+	audio_process_rdft_inverse(N, Y_re, Y_im, y_time);
 
 	const float ifft_scale = 2.0f / (float)N;
 	#pragma GCC ivdep
@@ -265,13 +229,12 @@ static void pbfdaf_process_block(struct aec_state *st,
 		step_bins[k] = (s > 0.4f) ? 0.4f : s;
 	}
 
-	/* 6. Filter adaptation in frequency domain */
+	/* 6. Filter adaptation in frequency domain with direct split RDFT */
 	float e_time[AEC_MAX_FFT_LEN] = {0};
 	memcpy(e_time + L, e_linear, L * sizeof(float));
-	audio_process_rdft(N, 1, e_time);
 
 	float E_re[AEC_MAX_BINS], E_im[AEC_MAX_BINS];
-	unpack_ooura_to_split(e_time, E_re, E_im, N);
+	audio_process_rdft_forward(N, e_time, E_re, E_im);
 
 	if (!double_talk && far_energy > st->far_pow_thd) {
 		for (int p = 0; p < P; p++) {
@@ -283,16 +246,14 @@ static void pbfdaf_process_block(struct aec_state *st,
 
 			/* Constrained gradient: IFFT -> zero uncausal half -> forward FFT */
 			float w_time[AEC_MAX_FFT_LEN];
-			pack_split_to_ooura(st->W_re[p], st->W_im[p], w_time, N);
-			audio_process_rdft(N, -1, w_time);
+			audio_process_rdft_inverse(N, st->W_re[p], st->W_im[p], w_time);
 
 			#pragma GCC ivdep
 			for (int i = 0; i < L; i++) {
 				w_time[i] *= ifft_scale;
 			}
 			memset(w_time + L, 0, L * sizeof(float));
-			audio_process_rdft(N, 1, w_time);
-			unpack_ooura_to_split(w_time, st->W_re[p], st->W_im[p], N);
+			audio_process_rdft_forward(N, w_time, st->W_re[p], st->W_im[p]);
 		}
 
 		if (st->mu > st->mu_min) {
@@ -338,8 +299,7 @@ static void pbfdaf_process_block(struct aec_state *st,
 			E_im[k] *= g_bin;
 		}
 
-		pack_split_to_ooura(E_re, E_im, e_time, N);
-		audio_process_rdft(N, -1, e_time);
+		audio_process_rdft_inverse(N, E_re, E_im, e_time);
 
 		#pragma GCC ivdep
 		for (int i = 0; i < L; i++) {
@@ -411,7 +371,7 @@ void *audio_process_aec_create(int sample_rate, const char *profile_path)
 		st->restrain_factor = (cfg.restrain_factor > 0.9f) ? 0.9f : cfg.restrain_factor;
 	}
 
-	audio_process_rdft(st->fft_len, 1, NULL);
+	aec_rdft_init();
 
 	h->aec = st;
 	return h;

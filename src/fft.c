@@ -364,66 +364,25 @@ void audio_process_rdft(size_t n, int isgn, float *a)
 void audio_process_rdft_forward(size_t n, const float *__restrict__ in_time,
 				float *__restrict__ out_re, float *__restrict__ out_im)
 {
-	if (!in_time || !out_re || !out_im)
-		return;
-
-	if (!tables_initialized)
-		init_tables();
-
 	float a[MAX_FFT_N];
 	memcpy(a, in_time, n * sizeof(float));
+	audio_process_rdft(n, 1, a);
 
-	size_t m = n >> 1;
-	size_t step = MAX_FFT_N / n;
-
-	complex_fft(a, m, 1);
-	float z0_re = a[0], z0_im = a[1];
-	out_re[0] = z0_re + z0_im;
+	size_t half_n = n >> 1;
+	out_re[0] = a[0];
 	out_im[0] = 0.0f;
-	out_re[m] = z0_re - z0_im;
-	out_im[m] = 0.0f;
+	out_re[half_n] = a[1];
+	out_im[half_n] = 0.0f;
 
-	size_t half_m = m >> 1;
-	float *__restrict__ p_k = a + 2;
-	float *__restrict__ p_sym = a + 2 * (m - 1);
-	const float *__restrict__ tw_r = tw_r_re + step;
-	const float *__restrict__ tw_i = tw_r_im + step;
-
-	for (size_t k = 1; k <= half_m; k++) {
-		float re_k = p_k[0], im_k = p_k[1];
-		float re_sym = p_sym[0], im_sym = p_sym[1];
-
-		float e_re = 0.5f * (re_k + re_sym);
-		float e_im = 0.5f * (im_k - im_sym);
-		float o_re = 0.5f * (im_k + im_sym);
-		float o_im = -0.5f * (re_k - re_sym);
-
-		float w_re = *tw_r;
-		float w_im = *tw_i;
-
-		float wo_re = w_re * o_re - w_im * o_im;
-		float wo_im = w_re * o_im + w_im * o_re;
-
-		out_re[k] = e_re + wo_re;
-		out_im[k] = e_im + wo_im;
-		if (k < m - k) {
-			out_re[m - k] = e_re - wo_re;
-			out_im[m - k] = -(e_im - wo_im);
-		}
-
-		p_k += 2;
-		p_sym -= 2;
-		tw_r += step;
-		tw_i += step;
+	for (size_t k = 1; k < half_n; k++) {
+		out_re[k] = a[2 * k];
+		out_im[k] = -a[2 * k + 1];
 	}
 }
 
 void audio_process_rdft_inverse(size_t n, const float *__restrict__ in_re,
 				const float *__restrict__ in_im, float *__restrict__ out_time)
 {
-	if (!in_re || !in_im || !out_time)
-		return;
-
 	float a[MAX_FFT_N];
 	size_t half_n = n >> 1;
 	a[0] = in_re[0];

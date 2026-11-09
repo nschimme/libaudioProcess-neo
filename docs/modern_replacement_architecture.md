@@ -8,8 +8,8 @@
 - Carries legacy code complexity (over 20,000 lines across WebRTC AEC, AGC, and NS).
 
 By designing modern, clean-room C11 replacement algorithms using a **black-box oracle strategy**, we can:
-1. Maintain **100% ABI compatibility** with Ingenic's `libimp.so` (matching all 31 exported symbols in `src/audio_process.h` and `libaudioProcess.map`).
-2. Maintain **100% INI configuration compatibility** with `webrtc_profile.ini`.
+1. Maintain **ABI compatibility** with Ingenic's `libimp.so`: the 19 symbols and frame formats that `libimp` resolves with `dlsym` (see §2.1). The library currently exports 31 symbols; the extra exports are ignored by `libimp` and are not part of the contract.
+2. Keep the AEC configuration compatible with `webrtc_profile.ini`: `libimp` hands the INI directory to `audio_process_aec_create`, and neo parses only `[Set_Far_Frame]`, `[Set_Near_Frame]` and `[AEC]`. The INI schema is owned by neo; the legacy `[AGC]`, `[HP]`, `[LE]`, `[NS]` and `[VAD]` blocks are ignored (AGC/NS/HPF settings reach the library through `libimp` calls driven by `raptor.conf`).
 3. Drop binary size by another ~50% (from 78 KB down to **~35 KB**).
 4. Substantially reduce CPU utilization on Thingino MIPS32r2 and RISC-V camera SoCs while achieving superior audio clarity and faster convergence.
 
@@ -24,6 +24,20 @@ The replacement algorithms strictly adhere to the existing public function inter
 | **AGC** | `audio_process_agc_create`<br>`audio_process_agc_set_config`<br>`audio_process_agc_get_config`<br>`audio_process_agc_process`<br>`audio_process_agc_free` | `WebRtcAgcConfig` (`targetLevelDbfs`, `compressionGaindB`, `limiterEnable`), `mode`, `min/max_level`, `sample_rate` |
 | **NS** | `audio_process_ns_create`<br>`audio_process_ns_set_config`<br>`audio_process_ns_get_config`<br>`audio_process_ns_process`<br>`audio_process_ns_free` | `policy` (0=mild, 1=medium, 2=aggressive, 3=very aggressive), `sample_rate` |
 | **AEC** | `audio_process_aec_create`<br>`audio_process_aec_process`<br>`audio_process_aec_free` | `webrtc_profile.ini` (`[Set_Far_Frame] Frame_V`, `[Set_Near_Frame] Frame_V`, `delay_ms`, `[AEC] set_suppression_mode`, `user_mode`, `mu_min`, `mu_decay`, `cor_thd1..4`, etc.) |
+
+### 2.1 Verified ABI Contract with `libimp`
+
+`libimp` embeds its own `audio_process.c`, loads `libaudioProcess.so` with `dlopen()` and resolves everything with `dlsym()` at runtime. A missing symbol is fatal for the whole audio pipeline.
+
+- **Required symbols (19, exact spelling):** `audio_process_{aec,agc,ns,hpf,hs}_{create,process,free}` (15), plus `audio_process_agc_set_config`, `audio_process_agc_get_config`, `audio_process_ns_set_config` and `audio_process_ns_get_config`. Extra exports are ignored.
+- **Lifecycle:** `create` once per `IMP_AI_EnableX`, `set_config` right after, `process` every 10 ms frame from the capture thread, `free` on disable. `free` must release everything.
+- **Frozen layouts:**
+  - `struct aec_frame { const int16_t *far; int16_t *near; int reserved; int num_bytes; }` is built on `libimp`'s stack; `num_bytes` is the byte count of one 10 ms frame.
+  - `WebRtcAgcConfig { int16_t targetLevelDbfs; int16_t compressionGaindB; uint8_t limiterEnable; }` is passed by value to `agc_set_config`.
+- **NS frame contract:** `process(ns, const float *const *in, num_bands, float *const *out)` on 10 ms frames of **mono float samples in int16 range** (not normalised to ±1.0), with `num_bands = 1` and `sample_rate / 100` samples per frame at every rate from 8 to 48 kHz. `set_config(ns, sample_rate, policy)` receives the raw `audio.ns_level` value 0–3. `ns_get_config` is a `void(void)` no-op that `libimp` calls and ignores; keep it callable.
+- **AGC** takes `int16` samples (a deliberate domain difference from NS) and round-trips the mic level (`in_mic_level` in, `*out_mic_level` out) and `*saturation_warning` on every frame. **HPF/HS** process `int16` in place with caller-owned state buffers and must not introduce hidden globals.
+- **Library:** MIPS o32, C linkage, `SONAME=libaudioProcess.so` (the Makefile sets it to match the vendor library), built against the target's libc flavour.
+- **Compatibility extension (not used by `libimp`):** `audio_process_ns_process` also accepts WebRTC-style pre-split 160-sample bands (`num_bands > 1` at 32 and 48 kHz). The upper bands follow the low band's gain and are delayed to stay aligned with it. This path is covered by unit tests only and has never run on real audio.
 
 ---
 
@@ -52,16 +66,15 @@ The replacement algorithms strictly adhere to the existing public function inter
 #### Legacy WebRTC Limitations
 - Requires subband splitting (`splitting_filter.c`), multi-band quantile noise tracking, and complex decision-directed a priori SNR estimation, taking > 3,500 lines of code and high memory bandwidth.
 
-#### Proposed Modern Design: Single-Pass Minimum Statistics + MMSE Spectral Subtraction
-- **Full-Band STFT**:
-  - Computes a single 128-point (8 kHz) or 256-point (16 kHz) real FFT on 10ms frames with 50% Hanning overlap, eliminating QMF subband filterbanks.
-- **Minimum Statistics Noise Floor Tracker**:
-  - Recursively tracks spectral power minima $P_{\text{noise}}(k)$ in each frequency bin over a 1.2-second sliding window without requiring a separate voice activity detector (VAD).
-- **Over-Subtraction Spectral Gain Mask**:
-  $$G(k) = \max\left(\beta,\; 1 - \alpha(\text{policy}) \cdot \frac{P_{\text{noise}}(k)}{P_{\text{noisy}}(k)}\right)$$
-  where $\alpha$ is derived from `policy` (0=1.0, 1=1.5, 2=2.2, 3=3.0) and $\beta$ is a small spectral floor (-15 dB to -25 dB) to prevent "musical noise" artifacts.
-- **Synthesis**: Invert via inverse real FFT and overlap-add back to the output frame.
-- **Complexity**: ~250 lines of C11 vs. 3,500 lines of WebRTC NS.
+#### Implemented Design: MCRA Noise Tracking + Decision-Directed Wiener Gain with OM-LSA Speech Presence
+The first design proposed here (minimum-statistics tracking with a fixed over-subtraction mask `G = max(beta, 1 - alpha * Pn/Py)`) was built and measured on the TCD-VoIP clips. It matched the stationary-noise attenuation gates but cut speech by 9-10 dB in every band (ViSQOL about 2.1 on clean speech against about 4.2 for the oracle), so it was replaced. The implemented design (`src/ns.c`, about 420 lines):
+- **STFT:** a 2L-sample window with a hop of one 10 ms frame (L = `sample_rate / 100`), zero-padded to a 256-, 512- or 1024-point real FFT, using a Vorbis power-complementary window. The Vorbis window has the same perfect-reconstruction property as the sine window with much lower sidelobes.
+- **Noise tracking (MCRA-style):** speech presence per bin from the ratio of smoothed power to a minimum tracked over about 1.2 s. The noise estimate follows `|Y|^2` with these guards, each added to fix a measured failure: the upward update is capped (and frozen in speech frames), it falls quickly toward lower power, and it has an absolute floor so digital silence cannot drive it to zero.
+- **Gain:** decision-directed a priori SNR feeds a Wiener gain, blended with the policy floor by an OM-LSA speech-presence probability (local frequency smoothing plus a frame-level term; the absence-prior cap is set per policy).
+- **Policy floors** are fitted so that stationary-noise attenuation meets the §4.2 gates.
+- **Latency:** one 10 ms frame (the overlap-add delay).
+- **Synthesis:** inverse real FFT and overlap-add.
+- **Known limits:** held-out results are strong on stationary noise (car, road) and weak on babble and office noise; the per-bin rules cannot reliably separate babble from speech. See the status notes in the project history for the per-type numbers.
 
 ---
 
@@ -94,7 +107,7 @@ The replacement algorithms strictly adhere to the existing public function inter
 - Ooura's `fft4g.c` (1,332 lines) is a general-purpose arbitrary-size FFT. It dynamically allocates bit-reversal tables and twiddle factor tables in RAM.
 
 #### Proposed Dedicated Real FFT
-- **Specialized for $N = 128$ and $N = 256$**:
+- **Specialized for $N = 128$ and $N = 256$** *(not re-verified: the implemented NS uses 256-, 512- and 1024-point transforms and the shared `src/fft.c`, so this section describes a proposal that has not been implemented for NS)*:
   - Hardcodes bit-reversal permutation and sine/cosine twiddle constants in `.rodata`.
   - Implements an unrolled 3-stage Radix-4 butterfly that computes real-to-half-complex transforms directly in registers without intermediate buffer loads.
 - **Impact**:
@@ -130,6 +143,8 @@ Tested on stationary Gaussian noise at 16 kHz:
 - **Policy 2 (Aggressive)**: **18.8 dB** attenuation (+6.0 dB deeper).
 - **Policy 3 (Very Aggressive)**: **21.7 dB** attenuation (+2.9 dB deeper).
 *(Notice the clean ~6 dB/step progression across policies 0, 1, and 2).*
+
+*How the NS gates are measured in `tests/unit_tests.c`:* 10 ms frames of uniform white noise (amplitude about 0.1), attenuation in dB of the RMS ratio. The oracle figures above were recorded on Gaussian noise at 16 kHz; the unit test uses uniform noise and also exercises 8, 24, 32 and 48 kHz. Steady state is taken over frames 200-259; a separate loose sanity bound covers the start-up window (frames 30-59), which varies by several dB with the noise realisation.
 
 #### C. AEC Empirical Oracle Profile
 Tested with 20ms acoustic echo delay coupled at -4.4 dB ($0.6\times$ amplitude):

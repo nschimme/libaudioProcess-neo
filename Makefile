@@ -10,7 +10,7 @@ CFLAGS += -fno-asynchronous-unwind-tables -fmerge-all-constants -fno-ident
 
 LDFLAGS  = -shared -fPIC
 LDFLAGS += -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--no-as-needed -lm -lpthread -flto
-LDFLAGS += -Wl,--version-script=$(SRCDIR)/libaudioProcess.map
+LDFLAGS += -Wl,--version-script=$(SRCDIR)/libaudioProcess.map -Wl,-soname,libaudioProcess.so
 
 AR      = $(CROSS_COMPILE)ar
 

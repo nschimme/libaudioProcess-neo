@@ -389,35 +389,60 @@ static void test_ns_guardrails(void)
 	if (fn_ns_get_config) fn_ns_get_config();
 
 	/* Multi-rate & multi-policy guardrail verification */
-	int test_rates[] = {8000, 16000, 24000, 32000, 48000};
-	for (int r = 0; r < 5; r++) {
-		int rate = test_rates[r];
-		int frame_len = rate / 100;
-		float *in_f = malloc(frame_len * sizeof(float));
-		float *out_f = malloc(frame_len * sizeof(float));
-		const float *inp = in_f;
-		float *outp = out_f;
+	/* Two band layouts are part of the contract:
+	 *  - one band of rate/100 samples at every rate (what libimp passes), and
+	 *  - WebRTC-style pre-split bands of 160 samples (2 at 32 kHz, 3 at 48 kHz). */
+	struct { int rate; int bands; } cases[] = {
+		{8000, 1}, {16000, 1}, {24000, 1}, {32000, 1}, {48000, 1}, {32000, 2}, {48000, 3}
+	};
+	for (int r = 0; r < 7; r++) {
+		int rate = cases[r].rate;
+		int num_bands = cases[r].bands;
+		int frame_len = (num_bands > 1) ? 160 : rate / 100;
+		float *in_f[3], *out_f[3];
+		const float *inp[3];
+		float *outp[3];
+		for (int b = 0; b < num_bands; b++) {
+			/* Exactly one band long: an over-read/over-write shows up under ASan */
+			in_f[b] = malloc(frame_len * sizeof(float));
+			out_f[b] = malloc(frame_len * sizeof(float));
+			inp[b] = in_f[b];
+			outp[b] = out_f[b];
+		}
 
 		for (int p = 0; p <= 3; p++) {
 			int set_rc = fn_ns_set_config(ns, rate, p);
 			ASSERT_TRUE(set_rc == 0, "ns set config multi-rate");
 
-			double sum_in = 0.0, sum_out = 0.0;
+			double sum_in = 0.0, sum_out = 0.0, hb_in = 0.0, hb_out = 0.0;
+			double su_in = 0.0, su_out = 0.0; /* start-up window (frames 30..59) */
 			srand(100 + r * 10 + p);
-			for (int f = 0; f < 60; f++) {
-				for (int i = 0; i < frame_len; i++) {
-					in_f[i] = ((float)(rand() % 2000) - 1000.0f) / 10000.0f;
-				}
-				fn_ns_process(ns, &inp, 1, &outp);
-				if (f >= 30) {
+			for (int f = 0; f < 260; f++) {
+				for (int b = 0; b < num_bands; b++)
+					for (int i = 0; i < frame_len; i++)
+						in_f[b][i] = ((float)(rand() % 2000) - 1000.0f) / 10000.0f;
+				fn_ns_process(ns, inp, num_bands, outp);
+				if (f >= 30 && f < 60) {
 					for (int i = 0; i < frame_len; i++) {
-						sum_in += in_f[i] * in_f[i];
-						sum_out += out_f[i] * out_f[i];
+						su_in += in_f[0][i] * in_f[0][i];
+						su_out += out_f[0][i] * out_f[0][i];
 					}
 				}
+				if (f >= 200) {
+					for (int i = 0; i < frame_len; i++) {
+						sum_in += in_f[0][i] * in_f[0][i];
+						sum_out += out_f[0][i] * out_f[0][i];
+					}
+					for (int b = 1; b < num_bands; b++)
+						for (int i = 0; i < frame_len; i++) {
+							hb_in += in_f[b][i] * in_f[b][i];
+							hb_out += out_f[b][i] * out_f[b][i];
+						}
+				}
 			}
-			double in_rms = sqrt(sum_in / (30 * frame_len));
-			double out_rms = sqrt(sum_out / (30 * frame_len));
+			double in_rms = sqrt(sum_in / (60 * frame_len));
+			double out_rms = sqrt(sum_out / (60 * frame_len));
+			double su_atten = 10.0 * log10((su_in + 1e-30) / (su_out + 1e-30));
 			double atten = 20.0 * log10(in_rms / (out_rms > 1e-9 ? out_rms : 1e-9));
 
 			/* Check acceptance gates matching and beating baseline oracle:
@@ -426,13 +451,42 @@ static void test_ns_guardrails(void)
 			 * Policy 2: 18.8 dB target (+- 2.0 dB)
 			 * Policy 3: > 21.0 dB target
 			 */
+			/* Steady-state (frames 200..259) must meet the oracle gates exactly; the
+			 * start-up window (frames 30..59) depends on the noise realization and
+			 * only has to show that suppression has clearly begun (loose sanity bound). */
+			ASSERT_TRUE(su_atten >= (p == 0 ? 3.5 : p == 1 ? 8.0 : 12.0), "Start-up attenuation sanity");
 			if (p == 0) ASSERT_TRUE(atten >= 5.5 && atten <= 8.0, "Policy 0 attenuation guardrail");
 			else if (p == 1) ASSERT_TRUE(atten >= 11.0 && atten <= 14.5, "Policy 1 attenuation guardrail");
 			else if (p == 2) ASSERT_TRUE(atten >= 16.5 && atten <= 21.0, "Policy 2 attenuation guardrail");
 			else if (p == 3) ASSERT_TRUE(atten >= 21.0, "Policy 3 attenuation guardrail");
+
+			/* Upper subbands must be attenuated like the low band (gain derived from it),
+			 * not by an unrelated constant, and must stay finite. */
+			if (num_bands > 1) {
+				double hb_att = 20.0 * log10(sqrt(hb_in) / (sqrt(hb_out) > 1e-9 ? sqrt(hb_out) : 1e-9));
+				ASSERT_TRUE(fabs(hb_att - atten) <= 6.0, "High-band attenuation tracks low band");
+			}
 		}
-		free(in_f);
-		free(out_f);
+
+		/* High bands must be a delayed, scaled copy: a unit impulse in a high band
+		 * comes out one frame (frame_len samples) later, not on the same frame. */
+		if (num_bands > 1) {
+			fn_ns_set_config(ns, rate, 0);
+			for (int f = 0; f < 80; f++) {
+				for (int b = 0; b < num_bands; b++)
+					for (int i = 0; i < frame_len; i++)
+						in_f[b][i] = (b == 1 && f == 40 && i == 5) ? 0.5f : 0.0f;
+				fn_ns_process(ns, inp, num_bands, outp);
+				if (f == 40)
+					ASSERT_TRUE(fabsf(out_f[1][5]) < 1e-6f, "High band is delayed by one frame");
+				if (f == 41)
+					ASSERT_TRUE(fabsf(out_f[1][5]) > 0.05f, "High band impulse arrives one frame later");
+			}
+		}
+		for (int b = 0; b < num_bands; b++) {
+			free(in_f[b]);
+			free(out_f[b]);
+		}
 	}
 
 	fn_ns_free(ns);

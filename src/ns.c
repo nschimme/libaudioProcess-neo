@@ -23,9 +23,17 @@
  */
 
 #define NS_MAX_FRAME_SIZE 480
+#define NS_BAND_LEN       160   /* samples per band for every rate except 8 kHz (WebRTC contract) */
+#define NS_MAX_HIGH_BANDS 2     /* 48 kHz: 3 bands = 1 low + 2 high */
 #define NS_MAX_FFT_LEN    1024
 #define NS_MAX_BINS       (NS_MAX_FFT_LEN / 2 + 1)
-#define NS_SUB_WIN_LEN    16
+#define NS_SUB_WIN_LEN    60
+#define NS_NOISE_FLOOR    1e-9f   /* absolute floor on the noise power estimate */
+#define NS_NOISE_FALL_AD  0.70f  /* noise update weight when power is below the estimate */
+#define NS_NOISE_UPD_CAP  5.0f   /* max |Y|^2 / noise accepted by the noise update */
+#define NS_SPP_SPAN       3
+#define NS_FRAME_P_GAIN   1.5f
+#define NS_MCRA_DELTA     28.0f   /* S/Smin ratio above which a bin is speech-like */
 
 struct modern_ns_state {
 	int sample_rate;
@@ -38,6 +46,12 @@ struct modern_ns_state {
 	float in_hist[NS_MAX_FRAME_SIZE];
 	float ola_out[NS_MAX_FRAME_SIZE];
 
+	/* Upper subbands (32/48 kHz callers pass pre-split 160-sample bands): they
+	 * are delayed by the low band's algorithmic latency and scaled by a gain
+	 * derived from the low band. */
+	float hb_hist[NS_MAX_HIGH_BANDS][NS_BAND_LEN];
+	float hb_gain;
+
 	float smooth_power[NS_MAX_BINS];
 	float noise_power[NS_MAX_BINS];
 	float min_power[NS_MAX_BINS];
@@ -45,6 +59,10 @@ struct modern_ns_state {
 	int sub_win_counter;
 
 	float prev_gain[NS_MAX_BINS];
+	float prev_gamma[NS_MAX_BINS];
+	float frame_p_prev;   /* previous frame's frame-level speech presence */
+	float prev_gh1[NS_MAX_BINS];  /* previous Wiener (speech-present) gain */
+	float spp[NS_MAX_BINS];   /* smoothed speech presence probability */
 	int frame_count;
 };
 
@@ -52,7 +70,11 @@ static void ns_init_window(struct modern_ns_state *st)
 {
 	int W = 2 * st->frame_size;
 	for (int i = 0; i < W; i++) {
-		st->win[i] = sinf((float)M_PI * ((float)i + 0.5f) / (float)W);
+		/* Vorbis power-complementary window: w[i]^2 + w[i+L]^2 = 1 like the sine
+		 * window, but with far lower sidelobes, so loud low-frequency speech does
+		 * not leak into high bins and inflate their noise floor. */
+		float sn = sinf((float)M_PI * ((float)i + 0.5f) / (float)W);
+		st->win[i] = sinf(0.5f * (float)M_PI * sn * sn);
 	}
 }
 
@@ -66,17 +88,14 @@ void *audio_process_ns_create(void)
 	return st;
 }
 
-int audio_process_ns_set_config(void *ns, int sample_rate, int policy)
+/* (Re)initialise the analysis state for a given band length. */
+static void ns_setup(struct modern_ns_state *st, int frame_size)
 {
-	struct modern_ns_state *st = (struct modern_ns_state *)ns;
-	if (!st)
-		return -1;
-
-	st->sample_rate = sample_rate > 0 ? sample_rate : 16000;
-	st->policy = policy;
-	st->frame_size = st->sample_rate / 100;
+	st->frame_size = frame_size;
 	if (st->frame_size > NS_MAX_FRAME_SIZE)
 		st->frame_size = NS_MAX_FRAME_SIZE;
+	if (st->frame_size < 1)
+		st->frame_size = 1;
 
 	int W = 2 * st->frame_size;
 	if (W <= 256)
@@ -95,13 +114,31 @@ int audio_process_ns_set_config(void *ns, int sample_rate, int policy)
 		st->min_power[k] = 1e-4f;
 		st->sub_min_power[k] = 1e-4f;
 		st->prev_gain[k] = 1.0f;
+		st->prev_gamma[k] = 1.0f;
+		st->prev_gh1[k] = 1.0f;
+		st->spp[k] = 0.0f;
 	}
 
 	st->sub_win_counter = 0;
 	st->frame_count = 0;
+	st->frame_p_prev = 0.0f;
 	memset(st->in_hist, 0, sizeof(st->in_hist));
 	memset(st->ola_out, 0, sizeof(st->ola_out));
+	memset(st->hb_hist, 0, sizeof(st->hb_hist));
+	st->hb_gain = 1.0f;
+}
 
+int audio_process_ns_set_config(void *ns, int sample_rate, int policy)
+{
+	struct modern_ns_state *st = (struct modern_ns_state *)ns;
+	if (!st)
+		return -1;
+
+	st->sample_rate = sample_rate > 0 ? sample_rate : 16000;
+	st->policy = policy;
+	/* Frame contract of the real caller (libimp): one mono band of 10 ms,
+	 * i.e. sample_rate / 100 samples, at every rate. */
+	ns_setup(st, st->sample_rate / 100);
 	return 0;
 }
 
@@ -115,6 +152,16 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 	struct modern_ns_state *st = (struct modern_ns_state *)ns;
 	if (!st || !in_bands || !*in_bands || !out_bands || !*out_bands || !num_bands)
 		return;
+
+	/* Two band layouts are honoured:
+	 *  - num_bands == 1: one band of sample_rate/100 samples (the libimp contract);
+	 *  - num_bands  > 1 at 32/48 kHz: WebRTC-style pre-split bands of 160 samples,
+	 *    where the low band is analysed at 16 kHz and the upper bands follow it. */
+	int want = st->sample_rate / 100;
+	if (num_bands > 1 && (st->sample_rate == 32000 || st->sample_rate == 48000))
+		want = NS_BAND_LEN;
+	if (want != st->frame_size)
+		ns_setup(st, want);
 
 	const int L = st->frame_size;
 	const int W = 2 * L;
@@ -169,12 +216,30 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 				st->sub_min_power[k] = sp;
 			}
 
-			/* Minimum statistics bias factor */
-			float est = st->min_power[k] * 1.5f;
-			if (est > st->noise_power[k])
-				st->noise_power[k] = 0.98f * st->noise_power[k] + 0.02f * est;
-			else
-				st->noise_power[k] = 0.90f * st->noise_power[k] + 0.10f * est;
+			/* MCRA: speech presence from smoothed-power / tracked-minimum ratio;
+			 * the noise estimate follows |Y|^2 and freezes as presence rises. */
+			float ratio = sp / (st->min_power[k] + 1e-12f);
+			float ind = (ratio > NS_MCRA_DELTA) ? 1.0f : 0.0f;
+			st->spp[k] = 0.8f * st->spp[k] + 0.2f * ind;
+			/* Frame-level presence from the previous frame also slows the rise, so the
+			 * estimate does not climb through weak speech bins during an utterance. */
+			float hold = st->spp[k] > st->frame_p_prev ? st->spp[k] : st->frame_p_prev;
+			float ad = 0.95f + 0.05f * hold;
+			/* Fall quickly toward a lower power so the estimate recovers between
+			 * utterances instead of inheriting the level of preceding speech. */
+			if (p[k] < st->noise_power[k])
+				ad = NS_NOISE_FALL_AD;
+			/* Bound the update input so a speech onset (|Y|^2 far above the noise)
+			 * cannot drag the estimate up before the presence probability reacts. */
+			float pin = p[k];
+			float cap = NS_NOISE_UPD_CAP * st->noise_power[k];
+			if (pin > cap)
+				pin = cap;
+			st->noise_power[k] = ad * st->noise_power[k] + (1.0f - ad) * pin;
+			/* Digital silence must not drive the estimate to zero: keep a tiny floor so
+			 * the next utterance is still recognised as far above the noise. */
+			if (st->noise_power[k] < NS_NOISE_FLOOR)
+				st->noise_power[k] = NS_NOISE_FLOOR;
 		}
 	}
 
@@ -184,34 +249,80 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 	 * Policy 2: 18.8 dB target (+-2.0 dB)
 	 * Policy 3: > 21.0 dB target
 	 */
-	static const float floor_table[4] = { 0.450f, 0.180f, 0.100f, 0.060f };
-	static const float alpha_table[4] = { 2.40f, 2.40f, 4.20f, 6.00f };
+	static const float floor_table[4] = { 0.450f, 0.220f, 0.075f, 0.028f };
+	/* Decision-directed smoothing of the a priori SNR */
+	const float dd = 0.95f;
 
 	int pol = st->policy;
 	if (pol < 0) pol = 0;
 	if (pol > 3) pol = 3;
 
-	float floor_val = floor_table[pol];
-	float alpha_os = alpha_table[pol];
+	const float floor_val = floor_table[pol];
+	/* Absence-prior cap: looser for the quality policies, strict for the very
+	 * aggressive one so it keeps its deep stationary-noise attenuation. */
+	static const float qcap_table[4] = { 0.60f, 0.60f, 0.60f, 0.95f };
+	const float q_cap = qcap_table[pol];
+	const float xi_min = 1e-3f;
+
+	/* Local (frequency-smoothed) and frame-level speech presence: weak bins
+	 * inside a speech frame / harmonic neighbourhood are not floored. */
+	float spp_l[NS_MAX_BINS];
+	float frame_p = 0.0f;
+	for (int k = 0; k < num_bins; k++) {
+		float acc = 0.0f;
+		int cnt = 0;
+		for (int d = -NS_SPP_SPAN; d <= NS_SPP_SPAN; d++) {
+			int j = k + d;
+			if (j >= 0 && j < num_bins) { acc += st->spp[j]; cnt++; }
+		}
+		spp_l[k] = acc / (float)cnt;
+		frame_p += st->spp[k];
+	}
+	frame_p = NS_FRAME_P_GAIN * (frame_p / (float)num_bins);
+	if (frame_p > 1.0f)
+		frame_p = 1.0f;
+
+	st->frame_p_prev = frame_p;
 
 	float gain[NS_MAX_BINS];
 	for (int k = 0; k < num_bins; k++) {
-		float p_noisy = st->smooth_power[k];
 		float p_noise = st->noise_power[k];
+		float gamma = st->smooth_power[k] / (p_noise > NS_NOISE_FLOOR ? p_noise : NS_NOISE_FLOOR);
 
-		float g;
-		if (p_noisy > 1e-12f)
-			g = 1.0f - alpha_os * (p_noise / p_noisy);
-		else
-			g = floor_val;
+		/* Decision-directed a priori SNR -> Wiener gain */
+		float post = gamma - 1.0f;
+		if (post < 0.0f)
+			post = 0.0f;
+		float g_prev = st->prev_gh1[k];
+		float xi = dd * g_prev * g_prev * st->prev_gamma[k] + (1.0f - dd) * post;
+		if (xi < xi_min)
+			xi = xi_min;
+		float g_h1 = xi / (1.0f + xi);
 
+		/* OM-LSA style blend: speech-present bins use Wiener, noise-only bins
+		 * sit exactly on the policy floor. */
+		/* OM-LSA conditional presence: prior from the tracker (q = absence),
+		 * likelihood from the a priori / a posteriori SNR. A bin far above the
+		 * noise estimate reaches p ~ 1 even if the tracker lags. */
+		float q = 1.0f - spp_l[k];
+		if (q > q_cap) q = q_cap;
+		float v = gamma * xi / (1.0f + xi);
+		float pr;
+		if (v > 20.0f) {
+			pr = 1.0f;
+		} else {
+			float lr = (q / (1.0f - q)) * (1.0f + xi) * expf(-v);
+			pr = 1.0f / (1.0f + lr);
+		}
+		if (frame_p > pr) pr = frame_p;
+		float g = pr * g_h1 + (1.0f - pr) * floor_val;
 		if (g < floor_val)
 			g = floor_val;
 		if (g > 1.0f)
 			g = 1.0f;
 
-		/* Smooth gain trajectory to eliminate musical noise artifacts */
-		g = 0.7f * st->prev_gain[k] + 0.3f * g;
+		st->prev_gamma[k] = gamma;
+		st->prev_gh1[k] = g_h1;
 		st->prev_gain[k] = g;
 		gain[k] = g;
 	}
@@ -234,12 +345,33 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 		st->ola_out[i] = fft_buf[i + L] * st->win[i + L];
 	}
 
-	/* If multi-band inputs are passed, apply floor attenuation to upper subbands */
-	for (int b = 1; b < num_bands; b++) {
-		const float *in_b = in_bands[b];
-		float *out_b = out_bands[b];
-		for (int i = 0; i < L; i++) {
-			out_b[i] = in_b[i] * floor_val;
+	/* Upper subbands: gain from the top quarter of the low band's final gain,
+	 * smoothed in time, floored at the policy floor; the bands themselves are
+	 * delayed by one frame so they stay aligned with the low band output. */
+	if (num_bands > 1) {
+		int k0 = (num_bins * 3) / 4;
+		float acc = 0.0f;
+		for (int k = k0; k < num_bins; k++)
+			acc += gain[k];
+		float target = acc / (float)(num_bins - k0);
+		if (target < floor_val) target = floor_val;
+		if (target > 1.0f) target = 1.0f;
+		st->hb_gain = 0.6f * st->hb_gain + 0.4f * target;
+		for (int b = 1; b < num_bands && b <= NS_MAX_HIGH_BANDS; b++) {
+			const float *in_b = in_bands[b];
+			float *out_b = out_bands[b];
+			if (!in_b || !out_b)
+				continue;
+			float *h = st->hb_hist[b - 1];
+			for (int i = 0; i < L; i++) {
+				float cur = in_b[i];
+				if (i < NS_BAND_LEN) {
+					out_b[i] = st->hb_gain * h[i];
+					h[i] = cur;
+				} else {
+					out_b[i] = st->hb_gain * cur;	/* beyond the delay line: no delay */
+				}
+			}
 		}
 	}
 }

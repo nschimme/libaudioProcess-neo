@@ -5,7 +5,8 @@
 #include <stdint.h>
 #include "audio_process.h"
 #include "util.h"
-#include "webrtc/modules/audio_processing/agc/legacy/gain_control.h"
+
+#define kAgcModeAdaptiveDigital 2
 
 #define AGC_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define AGC_MAX(a, b) ((a) > (b) ? (a) : (b))

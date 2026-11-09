@@ -5,7 +5,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "webrtc/modules/audio_processing/agc/legacy/gain_control.h"
+/* WebRtcAgcConfig definition matching legacy Ingenic ABI */
+typedef struct {
+	int16_t targetLevelDbfs;
+	int16_t compressionGaindB;
+	uint8_t limiterEnable;
+} WebRtcAgcConfig;
 
 #ifdef __cplusplus
 extern "C" {

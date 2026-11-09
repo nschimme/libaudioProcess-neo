@@ -5,7 +5,7 @@
 #include "audio_process.h"
 #include "biquad.h"
 #include "util.h"
-#include "webrtc/common_audio/signal_processing/include/signal_processing_library.h"
+#include <string.h>
 
 /*
  * Second-order Butterworth high-pass filter.
@@ -21,12 +21,20 @@
 #define HPF_CUTOFF_HZ 300
 #define HPF_DEFAULT_FS 16000
 
+static inline void set_w16(int16_t *ptr, int16_t val, int count)
+{
+	if (!ptr || count <= 0)
+		return;
+	for (int i = 0; i < count; i++)
+		ptr[i] = val;
+}
+
 void audio_process_hpf_create(int16_t *state_x, int16_t *state_y,
 			      int16_t init_x, int16_t init_y,
 			      int count_x, int count_y)
 {
-	WebRtcSpl_MemSetW16(state_x, init_x, count_x);
-	WebRtcSpl_MemSetW16(state_y, init_y, count_y);
+	set_w16(state_x, init_x, count_x);
+	set_w16(state_y, init_y, count_y);
 }
 
 int audio_process_hpf_process(int16_t *state, int16_t *data, int num_samples)

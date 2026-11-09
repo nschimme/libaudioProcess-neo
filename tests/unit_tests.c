@@ -388,26 +388,52 @@ static void test_ns_guardrails(void)
 	ASSERT_TRUE(res == 0, "ns set config");
 	if (fn_ns_get_config) fn_ns_get_config();
 
-	/* E2E Test: Stationary noise suppression convergence */
-	float in_buf[160];
-	float out_buf[160];
-	const float *in_ptr = in_buf;
-	float *out_ptr = out_buf;
+	/* Multi-rate & multi-policy guardrail verification */
+	int test_rates[] = {8000, 16000, 24000, 32000, 48000};
+	for (int r = 0; r < 5; r++) {
+		int rate = test_rates[r];
+		int frame_len = rate / 100;
+		float *in_f = malloc(frame_len * sizeof(float));
+		float *out_f = malloc(frame_len * sizeof(float));
+		const float *inp = in_f;
+		float *outp = out_f;
 
-	double initial_noise_rms = 0.0;
-	double final_noise_rms = 0.0;
+		for (int p = 0; p <= 3; p++) {
+			int set_rc = fn_ns_set_config(ns, rate, p);
+			ASSERT_TRUE(set_rc == 0, "ns set config multi-rate");
 
-	for (int f = 0; f < 50; f++) {
-		for (int i = 0; i < 160; i++) {
-			in_buf[i] = ((float)(rand() % 2000) - 1000.0f) / 10000.0f;
+			double sum_in = 0.0, sum_out = 0.0;
+			srand(100 + r * 10 + p);
+			for (int f = 0; f < 60; f++) {
+				for (int i = 0; i < frame_len; i++) {
+					in_f[i] = ((float)(rand() % 2000) - 1000.0f) / 10000.0f;
+				}
+				fn_ns_process(ns, &inp, 1, &outp);
+				if (f >= 30) {
+					for (int i = 0; i < frame_len; i++) {
+						sum_in += in_f[i] * in_f[i];
+						sum_out += out_f[i] * out_f[i];
+					}
+				}
+			}
+			double in_rms = sqrt(sum_in / (30 * frame_len));
+			double out_rms = sqrt(sum_out / (30 * frame_len));
+			double atten = 20.0 * log10(in_rms / (out_rms > 1e-9 ? out_rms : 1e-9));
+
+			/* Check acceptance gates matching and beating baseline oracle:
+			 * Policy 0: 6.8 dB target (+- 1.0 dB)
+			 * Policy 1: 12.8 dB target (+- 1.5 dB)
+			 * Policy 2: 18.8 dB target (+- 2.0 dB)
+			 * Policy 3: > 21.0 dB target
+			 */
+			if (p == 0) ASSERT_TRUE(atten >= 5.5 && atten <= 8.0, "Policy 0 attenuation guardrail");
+			else if (p == 1) ASSERT_TRUE(atten >= 11.0 && atten <= 14.5, "Policy 1 attenuation guardrail");
+			else if (p == 2) ASSERT_TRUE(atten >= 16.5 && atten <= 21.0, "Policy 2 attenuation guardrail");
+			else if (p == 3) ASSERT_TRUE(atten >= 21.0, "Policy 3 attenuation guardrail");
 		}
-		if (f == 0) initial_noise_rms = compute_rms_f32(in_buf, 0, 160);
-		fn_ns_process(ns, &in_ptr, 1, &out_ptr);
-		if (f == 49) final_noise_rms = compute_rms_f32(out_buf, 0, 160);
+		free(in_f);
+		free(out_f);
 	}
-
-	double snr_gain_db = 20.0 * log10(initial_noise_rms / (final_noise_rms > 1e-6 ? final_noise_rms : 1e-6));
-	ASSERT_TRUE(snr_gain_db > 5.0, "NS achieves > 5 dB stationary noise attenuation");
 
 	fn_ns_free(ns);
 	printf("  -> PASS\n");
@@ -473,10 +499,13 @@ static void test_fft_guardrails(void)
 	printf("Running test_fft_guardrails...\n");
 	extern void audio_process_rdft(size_t n, int isgn, float *a);
 
-	int sizes[] = {128, 256, 512};
-	for (int s = 0; s < 3; s++) {
+	extern void audio_process_rdft_forward(size_t n, const float *in_time, float *out_re, float *out_im);
+	extern void audio_process_rdft_inverse(size_t n, const float *in_re, const float *in_im, float *out_time);
+
+	int sizes[] = {128, 256, 512, 1024};
+	for (int s = 0; s < 4; s++) {
 		int n = sizes[s];
-		float orig[512], a[512];
+		float orig[1024], a[1024];
 		float orig_energy = 0.0f;
 		for (int i = 0; i < n; i++) {
 			orig[i] = sinf((float)i * 0.25f) + 0.5f * cosf((float)i * 0.77f);
@@ -484,6 +513,7 @@ static void test_fft_guardrails(void)
 			orig_energy += orig[i] * orig[i];
 		}
 
+		/* Legacy packed interface */
 		audio_process_rdft(n, 1, a);
 		audio_process_rdft(n, -1, a);
 
@@ -500,6 +530,20 @@ static void test_fft_guardrails(void)
 		ASSERT_TRUE(max_recon_err < 1e-4f, "FFT roundtrip max error within 1e-4");
 		float energy_diff = fabsf(recon_energy - orig_energy) / orig_energy;
 		ASSERT_TRUE(energy_diff < 1e-4f, "FFT energy conserved within 1e-4");
+
+		/* Direct natural split-complex interface */
+		float re[513], im[513], y[1024];
+		audio_process_rdft_forward(n, orig, re, im);
+		audio_process_rdft_inverse(n, re, im, y);
+
+		float max_split_err = 0.0f;
+		for (int i = 0; i < n; i++) {
+			float r = y[i] * 2.0f / (float)n;
+			float err = fabsf(r - orig[i]);
+			if (err > max_split_err)
+				max_split_err = err;
+		}
+		ASSERT_TRUE(max_split_err < 1e-4f, "Split RDFT roundtrip error within 1e-4");
 	}
 	printf("  -> PASS\n");
 }

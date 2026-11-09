@@ -6,7 +6,7 @@
 
 #include "audio_process.h"
 #include "biquad.h"
-#include "webrtc/common_audio/fft4g.h"
+#include "fft.h"
 
 #define HD_FFT_SIZE    128
 #define HD_HALF_FFT    64

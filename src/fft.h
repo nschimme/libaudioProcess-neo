@@ -12,16 +12,20 @@ extern "C" {
 /*
  * Modern Clean-Room Radix-4/2 Real-Valued FFT / IFFT (RDFT)
  *
- * Provides optimized real FFT transforms matching Ooura's RDFT frequency packing:
- *   a[0] = DC real
- *   a[1] = Nyquist real
- *   a[2*k] = Re(X[k])
- *   a[2*k + 1] = -Im(X[k])   (for k = 1 .. N/2 - 1)
+ * Supported sizes: 128, 256, 512, 1024.
  *
- * Sizes supported: 128, 256, 512.
+ * Natural Split-Complex Interface (clean-room, direct split-complex buffers):
+ *   audio_process_rdft_forward(n, in_time, out_re, out_im);
+ *   audio_process_rdft_inverse(n, in_re, in_im, out_time);
+ *
+ * Legacy packed interface (Ooura format compatibility):
+ *   audio_process_rdft(n, isgn, a);
  */
 
 void audio_process_rdft(size_t n, int isgn, float *a);
+
+void audio_process_rdft_forward(size_t n, const float *in_time, float *out_re, float *out_im);
+void audio_process_rdft_inverse(size_t n, const float *in_re, const float *in_im, float *out_time);
 
 /* ABI drop-in replacements for WebRTC legacy symbols */
 void WebRtc_rdft(size_t n, int isgn, float *a, size_t *ip, float *w);

@@ -14,10 +14,10 @@
  * Implements high-throughput, cache-efficient, in-place real transforms
  * using pre-computed twiddle tables and branchless bit-reversal permutations.
  *
- * Supported sizes: 128, 256, 512.
+ * Supported sizes: 128, 256, 512, 1024.
  */
 
-#define MAX_FFT_N 512
+#define MAX_FFT_N 1024
 #define MAX_FFT_M (MAX_FFT_N / 2)
 
 static uint8_t pair_64_i[32], pair_64_j[32];
@@ -29,9 +29,12 @@ static int n_pairs_128 = 0;
 static uint16_t pair_256_i[128], pair_256_j[128];
 static int n_pairs_256 = 0;
 
-static float tw_stage_fwd_re[256];
-static float tw_stage_fwd_im[256];
-static float tw_stage_inv_im[256];
+static uint16_t pair_512_i[256], pair_512_j[256];
+static int n_pairs_512 = 0;
+
+static float tw_stage_fwd_re[512];
+static float tw_stage_fwd_im[512];
+static float tw_stage_inv_im[512];
 
 static float tw_r_re[MAX_FFT_N / 4 + 1];
 static float tw_r_im[MAX_FFT_N / 4 + 1];
@@ -85,8 +88,22 @@ static void init_tables(void)
 		}
 	}
 
+	n_pairs_512 = 0;
+	for (uint32_t i = 0; i < 512; i++) {
+		uint32_t r = 0;
+		for (int b = 0; b < 9; b++) {
+			if (i & (1 << b))
+				r |= (1 << (8 - b));
+		}
+		if (i < r) {
+			pair_512_i[n_pairs_512] = (uint16_t)i;
+			pair_512_j[n_pairs_512] = (uint16_t)r;
+			n_pairs_512++;
+		}
+	}
+
 	int off = 0;
-	for (int len = 4; len <= 256; len <<= 1) {
+	for (int len = 4; len <= 512; len <<= 1) {
 		int half = len >> 1;
 		for (int j = 0; j < half; j++) {
 			double angle = -2.0 * M_PI * (double)j / (double)len;
@@ -98,9 +115,9 @@ static void init_tables(void)
 	}
 
 	for (size_t k = 0; k <= MAX_FFT_N / 4; k++) {
-		double angle = 2.0 * M_PI * (double)k / (double)MAX_FFT_N;
+		double angle = -2.0 * M_PI * (double)k / (double)MAX_FFT_N;
 		tw_r_re[k] = (float)cos(angle);
-		tw_r_im[k] = (float)(-sin(angle));
+		tw_r_im[k] = (float)sin(angle);
 	}
 
 	tables_initialized = 1;
@@ -132,6 +149,16 @@ static inline void bit_reverse_permute(float *__restrict__ a, size_t m)
 		for (int p = 0; p < n_pairs_256; p++) {
 			size_t i = pair_256_i[p];
 			size_t j = pair_256_j[p];
+			float tr0 = a[2 * i], ti0 = a[2 * i + 1];
+			a[2 * i] = a[2 * j];
+			a[2 * i + 1] = a[2 * j + 1];
+			a[2 * j] = tr0;
+			a[2 * j + 1] = ti0;
+		}
+	} else if (m == 512) {
+		for (int p = 0; p < n_pairs_512; p++) {
+			size_t i = pair_512_i[p];
+			size_t j = pair_512_j[p];
 			float tr0 = a[2 * i], ti0 = a[2 * i + 1];
 			a[2 * i] = a[2 * j];
 			a[2 * i + 1] = a[2 * j + 1];
@@ -241,7 +268,7 @@ static void complex_fft(float *__restrict__ a, size_t m, int isgn)
 
 void audio_process_rdft(size_t n, int isgn, float *a)
 {
-	if (!a || (n != 128 && n != 256 && n != 512))
+	if (!a || (n != 128 && n != 256 && n != 512 && n != 1024))
 		return;
 
 	if (!tables_initialized)
@@ -332,6 +359,83 @@ void audio_process_rdft(size_t n, int isgn, float *a)
 
 		complex_fft(a, m, -1);
 	}
+}
+
+void audio_process_rdft_forward(size_t n, const float *__restrict__ in_time,
+				float *__restrict__ out_re, float *__restrict__ out_im)
+{
+	if (!in_time || !out_re || !out_im)
+		return;
+
+	if (!tables_initialized)
+		init_tables();
+
+	float a[MAX_FFT_N];
+	memcpy(a, in_time, n * sizeof(float));
+
+	size_t m = n >> 1;
+	size_t step = MAX_FFT_N / n;
+
+	complex_fft(a, m, 1);
+	float z0_re = a[0], z0_im = a[1];
+	out_re[0] = z0_re + z0_im;
+	out_im[0] = 0.0f;
+	out_re[m] = z0_re - z0_im;
+	out_im[m] = 0.0f;
+
+	size_t half_m = m >> 1;
+	float *__restrict__ p_k = a + 2;
+	float *__restrict__ p_sym = a + 2 * (m - 1);
+	const float *__restrict__ tw_r = tw_r_re + step;
+	const float *__restrict__ tw_i = tw_r_im + step;
+
+	for (size_t k = 1; k <= half_m; k++) {
+		float re_k = p_k[0], im_k = p_k[1];
+		float re_sym = p_sym[0], im_sym = p_sym[1];
+
+		float e_re = 0.5f * (re_k + re_sym);
+		float e_im = 0.5f * (im_k - im_sym);
+		float o_re = 0.5f * (im_k + im_sym);
+		float o_im = -0.5f * (re_k - re_sym);
+
+		float w_re = *tw_r;
+		float w_im = *tw_i;
+
+		float wo_re = w_re * o_re - w_im * o_im;
+		float wo_im = w_re * o_im + w_im * o_re;
+
+		out_re[k] = e_re + wo_re;
+		out_im[k] = e_im + wo_im;
+		if (k < m - k) {
+			out_re[m - k] = e_re - wo_re;
+			out_im[m - k] = -(e_im - wo_im);
+		}
+
+		p_k += 2;
+		p_sym -= 2;
+		tw_r += step;
+		tw_i += step;
+	}
+}
+
+void audio_process_rdft_inverse(size_t n, const float *__restrict__ in_re,
+				const float *__restrict__ in_im, float *__restrict__ out_time)
+{
+	if (!in_re || !in_im || !out_time)
+		return;
+
+	float a[MAX_FFT_N];
+	size_t half_n = n >> 1;
+	a[0] = in_re[0];
+	a[1] = in_re[half_n];
+
+	for (size_t k = 1; k < half_n; k++) {
+		a[2 * k] = in_re[k];
+		a[2 * k + 1] = -in_im[k];
+	}
+
+	audio_process_rdft(n, -1, a);
+	memcpy(out_time, a, n * sizeof(float));
 }
 
 /* Drop-in replacements for WebRTC legacy symbols */

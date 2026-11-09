@@ -493,6 +493,154 @@ static void test_ns_guardrails(void)
 	printf("  -> PASS\n");
 }
 
+/* Regression guards for failures found while tuning the NS. Each one protects a
+ * behaviour a real caller depends on, using synthetic signals that need no
+ * dataset:
+ *  - speech passes through nearly untouched,
+ *  - speech after digital silence is not mistaken for noise,
+ *  - the result does not depend on the sample scale,
+ *  - in-place processing equals separate buffers,
+ *  - set_config fully resets the state (create-per-enable). */
+typedef void (*ns_proc_fn)(void *, const float *const *, int, float *const *);
+
+/* Voiced-speech-like test signal: 12 harmonics of 140 Hz under a 4 Hz raised-cosine
+ * envelope, in int16-range floats. */
+static float ns_speech_sample(int n, int rate, float amp)
+{
+	double t = (double)n / rate, v = 0.0;
+	for (int h = 1; h <= 12; h++)
+		v += sin(2.0 * M_PI * 140.0 * h * t) / h;
+	double env = 0.5 * (1.0 - cos(2.0 * M_PI * 4.0 * t));
+	return (float)(amp * env * v);
+}
+
+static void ns_run(void *ns, ns_proc_fn proc, const float *in, float *out, int n, int frame, int inplace)
+{
+	static float work[480];
+	for (int i = 0; i + frame <= n; i += frame) {
+		memcpy(work, in + i, frame * sizeof(float));
+		const float *ip = work;
+		float tmp[480];
+		float *op = inplace ? work : tmp;
+		proc(ns, &ip, 1, &op);
+		memcpy(out + i, op, frame * sizeof(float));
+	}
+}
+
+static double ns_rms_db(const float *x, int from, int to)
+{
+	double s = 0.0;
+	for (int i = from; i < to; i++)
+		s += (double)x[i] * x[i];
+	return 10.0 * log10(s / (to - from) + 1e-30);
+}
+
+static void test_ns_regressions(void)
+{
+	printf("Running test_ns_regressions (E2E)...\n");
+	void *handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+	if (!handle) handle = dlopen("./libaudioProcess.so", RTLD_NOW | RTLD_GLOBAL);
+	void *(*create)(void) = dlsym(handle, "audio_process_ns_create");
+	int (*set_config)(void *, int, int) = dlsym(handle, "audio_process_ns_set_config");
+	ns_proc_fn proc = dlsym(handle, "audio_process_ns_process");
+	int (*nfree)(void *) = dlsym(handle, "audio_process_ns_free");
+	if (!create || !set_config || !proc || !nfree) {
+		printf("  [SKIP - NS symbols not in binary link]\n");
+		return;
+	}
+
+	const int rate = 16000, frame = 160, N = rate * 4;
+	float *sig = malloc(N * sizeof(float)), *out = malloc(N * sizeof(float));
+	float *out2 = malloc(N * sizeof(float)), *scaled = malloc(N * sizeof(float));
+
+	/* 1. Speech in light noise (about 35 dB SNR) must stay close to unity. The first
+	 * second is noise only, so the tracker has something to learn. */
+	srand(11);
+	for (int i = 0; i < N; i++)
+		sig[i] = ((float)(rand() % 2000) - 1000.0f) * 0.03f + (i >= rate ? ns_speech_sample(i, rate, 3000.0f) : 0.0f);
+	for (int pol = 0; pol <= 2; pol++) {
+		void *ns = create();
+		set_config(ns, rate, pol);
+		ns_run(ns, proc, sig, out, N, frame, 0);
+		/* output lags the input by one frame */
+		double din = ns_rms_db(sig, rate + 2 * rate / 2, N - frame);
+		double dout = ns_rms_db(out, rate + 2 * rate / 2 + frame, N);
+		ASSERT_TRUE(din - dout < 3.0, "NS passes speech in light noise within 3 dB");
+		nfree(ns);
+	}
+
+	/* 2. Speech after digital silence. Pauses of exact zeros drove the noise estimate to
+	 * zero and the next utterance was cut by 13-20 dB (seen on the TCD echo clips). */
+	memset(sig, 0, N * sizeof(float));
+	for (int i = 2 * rate; i < N; i++)
+		sig[i] = ns_speech_sample(i - 2 * rate, rate, 3000.0f);
+	{
+		void *ns = create();
+		set_config(ns, rate, 2);
+		ns_run(ns, proc, sig, out, N, frame, 0);
+		int a = 2 * rate + rate / 2, b = N - frame;
+		ASSERT_TRUE(ns_rms_db(sig, a, b) - ns_rms_db(out, a + frame, b + frame) < 3.0,
+			    "NS does not cut speech that follows digital silence");
+		nfree(ns);
+	}
+
+	/* 3. Scale invariance: int16-range input and the same signal scaled by 1/32768. */
+	srand(12);
+	for (int i = 0; i < N; i++)
+		sig[i] = ((float)(rand() % 2000) - 1000.0f) * 0.1f + ns_speech_sample(i, rate, 2000.0f);
+	for (int i = 0; i < N; i++)
+		scaled[i] = sig[i] / 32768.0f;
+	{
+		void *a = create(), *b = create();
+		set_config(a, rate, 2);
+		set_config(b, rate, 2);
+		ns_run(a, proc, sig, out, N, frame, 0);
+		ns_run(b, proc, scaled, out2, N, frame, 0);
+		double sg = 0.0, er = 0.0;
+		for (int i = 0; i < N; i++) {
+			double x = out[i] / 32768.0, d = x - out2[i];
+			sg += x * x;
+			er += d * d;
+		}
+		ASSERT_TRUE(10.0 * log10((sg + 1e-30) / (er + 1e-30)) > 40.0,
+			    "NS result is independent of sample scale (>40 dB agreement)");
+		nfree(a);
+		nfree(b);
+	}
+
+	/* 4. In-place processing equals separate buffers, bit for bit. */
+	{
+		void *a = create(), *b = create();
+		set_config(a, rate, 2);
+		set_config(b, rate, 2);
+		ns_run(a, proc, sig, out, N, frame, 0);
+		ns_run(b, proc, sig, out2, N, frame, 1);
+		ASSERT_TRUE(memcmp(out, out2, N * sizeof(float)) == 0, "NS in-place equals separate buffers");
+		nfree(a);
+		nfree(b);
+	}
+
+	/* 5. set_config resets the state: a reused instance equals a fresh one. */
+	{
+		void *a = create(), *b = create();
+		set_config(a, rate, 2);
+		ns_run(a, proc, sig, out, N, frame, 0); /* dirty the state */
+		set_config(a, rate, 2);
+		set_config(b, rate, 2);
+		ns_run(a, proc, sig, out, N, frame, 0);
+		ns_run(b, proc, sig, out2, N, frame, 0);
+		ASSERT_TRUE(memcmp(out, out2, N * sizeof(float)) == 0, "NS set_config fully resets the state");
+		nfree(a);
+		nfree(b);
+	}
+
+	free(sig);
+	free(out);
+	free(out2);
+	free(scaled);
+	printf("  -> PASS\n");
+}
+
 /* Test 10: AEC (Acoustic Echo Cancellation) E2E Regression Tests */
 static void test_aec_guardrails(void)
 {
@@ -637,6 +785,9 @@ int main(void)
 
 	test_ns_guardrails();
 	record_quality_gate("NS", "Stationary Noise Attenuation", "> 5.0 dB", "6.8--18.8 dB", "PASS");
+
+	test_ns_regressions();
+	record_quality_gate("NS", "Speech Transparency & Robustness", "< 3 dB speech loss", "Within gates", "PASS");
 
 	test_aec_guardrails();
 	record_quality_gate("AEC", "Echo Return Loss (ERLE)", "> 6.0 dB", "> 130 dB", "PASS");

@@ -84,12 +84,12 @@ Provenance is tagged on each item: **[reported]** means reported by the Thingino
 #### Implemented Design: MCRA Noise Tracking + Decision-Directed Wiener Gain with OM-LSA Speech Presence
 The first design proposed here (minimum-statistics tracking with a fixed over-subtraction mask `G = max(beta, 1 - alpha * Pn/Py)`) was built and measured on the TCD-VoIP clips. It matched the stationary-noise attenuation gates but cut speech by 9-10 dB in every band (ViSQOL about 2.1 on clean speech against about 4.2 for the oracle), so it was replaced. The implemented design (`src/ns.c`, about 420 lines):
 - **STFT (low-delay filterbank):** a window of W = L + ov samples with a hop of L, where L is the band length (80 samples at 8 kHz, 160 at 16, 32 and 48 kHz) and ov = 3L/5 (48 or 96 samples). The window is a power-complementary rising ramp of ov samples (a `sin(pi/2 * sin^2)` curve, whose low sidelobes keep loud low-frequency speech from leaking into high bins), a flat top of L - ov samples, and the mirrored falling ramp. With a hop of L the falling ramp of one frame overlaps the rising ramp of the next in exactly ov samples, so the overlap-add reconstructs perfectly. The FFT length equals the window: a 128-point real FFT at 8 kHz and a 256-point real FFT at 16, 32 and 48 kHz. At 32/48 kHz the band is analysed as 16 kHz audio.
-- **Noise tracking (MCRA-style):** speech presence per bin from the ratio of smoothed power to a minimum tracked over about 1.2 s. The noise estimate follows `|Y|^2` with these guards, each added to fix a measured failure: the upward update is capped (and frozen in speech frames), it falls quickly toward lower power, and it has an absolute floor so digital silence cannot drive it to zero.
+- **Noise tracking (MCRA-style):** speech presence per bin from the ratio of smoothed power to a minimum tracked over about 1.2 s. The noise estimate follows the power with these guards, each added to fix a measured failure: (1) the fall target depends on the frame type, the raw power in speech frames and the smoothed power in pauses, because chasing instantaneous troughs in pauses biased the estimate 5-10 dB low and let fluctuating noise (babble) pass as speech; (2) a bin whose smoothed power is more than 10x the current estimate is treated as signal and the estimate rises only slowly there (weight 0.995), because the windowed-minimum ratio cannot flag rapidly modulated sparse sounds such as a harmonic voice or a tone; (3) the upward update is capped and slowed in frames that follow speech; (4) the estimate has an absolute floor so digital silence cannot drive it to zero; (5) the first frame seeds the smoothed power with its own power, so start-up does not depend on the absolute signal level.
 - **Gain:** decision-directed a priori SNR feeds a Wiener gain, blended with the policy floor by an OM-LSA speech-presence probability (local frequency smoothing plus a frame-level term; the absence-prior cap is set per policy).
-- **Policy floors** are fitted so that stationary-noise attenuation meets the §4.2 gates.
+- **Policy floors** equal the documented oracle attenuation, `10^(-dB/20)`: 0.457, 0.229 and 0.115 for policies 0-2 (6.8, 12.8 and 18.8 dB) and 0.070 for policy 3 (23 dB; the §4.2 gate is only a lower bound of 21 dB). The estimate converges to the floor on stationary noise, so measured attenuation matches these figures.
 - **Latency:** ov samples, the overlap of the window ramps: 96 samples (6.0 ms) at 16 kHz and 48 samples (6.0 ms) at 8 kHz, measured by cross-correlation. This equals the measured delay of the vendor-twin WebRTC NS at 16 kHz (96 samples). The upper subbands of the compatibility path are delayed by the same ov samples.
 - **Synthesis:** inverse real FFT and overlap-add.
-- **Known limits:** held-out results are strong on stationary noise (car, road) and weak on babble and office noise; the per-bin rules cannot reliably separate babble from speech. See the status notes in the project history for the per-type numbers.
+- **Known limits:** car noise trails the oracle slightly (see §4.5). Sparse tonal sounds are kept by the slow-rise rule, which also means a loud stationary tone may be passed rather than suppressed. The multi-band (32/48 kHz) path has never run on real audio.
 
 ---
 
@@ -243,17 +243,28 @@ These are measurements taken while building the NS, recorded so the quality gate
 - The ViSQOL model appears to have been trained on TCD-VoIP data, so its agreement here is probably inflated.
 - Human scores exist only for unprocessed degradations. None of this validates how either metric judges noise-suppression artifacts.
 
-**Held-out noise files** (68 noise files outside the 8 gate clips, split by speaker into a development half, speakers FA and MK, and a test half, speakers FG and ML; the test half has been scored once, for one earlier build, and is not otherwise used for decisions)
-- All 68 files, earlier build, policy 2: 41 pass, mean delta -0.002. By type: car 17 of 18 pass (mean +0.25), road 14 of 18 (+0.12), office 9 of 18 (-0.08), babble 1 of 14 (-0.38).
-- Development half, current build, policy 2: 20 of 34 pass (babble 0 of 7, car 8 of 9, office 5 of 9, road 7 of 9).
-- Development half, current build, policy 1: 23 of 34 pass, mean delta -0.030; babble 1 of 7 (mean -0.25), car 9 of 9 (+0.13), office 6 of 9 (-0.05), road 7 of 9 (-0.01).
-- On the development half the baseline improves on unprocessed audio by about 0.25 MOS on average (3.11 against 2.86 at policy 2), so avoiding harm is not the bar.
-- The NS is clearly better than the baseline on stationary noise (car, road) and behind it on babble and office noise.
+**Which metric is trusted**
+- Lag-compensated, full-length Zimtohrli is the trusted metric. Zimtohrli does no internal alignment and is very sensitive to delay: a clean clip delayed by 96 samples drops from 4.96 to 4.34, and 160 samples scores higher than 96. Outputs must therefore be advanced by their known delay (96 samples at 16 kHz, 48 at 8 kHz) before scoring; scoring uncompensated outputs against a zero-delay reference biases every comparison against the noise suppressor. CI's `compute_mos` truncates Zimtohrli to 3.5 s and does not compensate delay. ViSQOL aligns internally and is reported alongside as a second opinion. The metrics disagree in places (for example car noise), and neither has been validated on suppressed audio.
+- Earlier statements in the project history that the NS is clearly better than the baseline on stationary noise were ViSQOL results and do not hold under Zimtohrli for earlier builds.
+
+**Noise files outside the 8 gate clips** (68 files, split by speaker into a development half, speakers FA and MK, and a test half, speakers FG and ML; the test half has been scored once, for an earlier build under ViSQOL only, and is not otherwise used for decisions)
+- Development half, lag-compensated Zimtohrli, delta against the oracle, files within -0.05 (current build):
+
+| | Mean delta | Pass | babble | car | office | road |
+|---|---|---|---|---|---|---|
+| 16 kHz, policy 1 (default) | +0.026 | 30 of 34 | +0.10 (7/7) | -0.03 (7/9) | +0.05 (8/9) | +0.01 (8/9) |
+| 16 kHz, policy 2 | +0.023 | 29 of 34 | +0.02 (6/7) | -0.03 (7/9) | +0.09 (7/9) | +0.02 (9/9) |
+| 8 kHz, policy 1 | +0.024 | 28 of 34 | +0.16 (7/7) | -0.03 (6/9) | -0.03 (7/9) | +0.02 (8/9) |
+
+- The 8 gate clips score within +0.01 to +0.02 of the oracle and of unprocessed audio under Zimtohrli, so they cannot separate builds.
+- On the same set unprocessed audio scores 0.12 below the oracle (3.46 against 3.58), so the oracle does improve on doing nothing and so does the current build (3.61).
+- The previously committed clean-room NS scored -0.30 against the oracle; an intermediate build with a plain MCRA tracker scored -0.06.
+- Dev was used to choose among about ten builds, so these figures are optimistic; the test half is reserved for one final run.
 
 **Throughput** (x86 host, `bench_and_test`; the MIPS figure has to come from CI)
-- NS throughput: WebRTC baseline 16-18 MS/s, the previously committed clean-room NS about 32 MS/s, current NS 39-41 MS/s (about 2.2-2.5x the baseline on x86). Earlier builds of the current design with a longer window ran at about 20 MS/s (+8-19%).
-- Instruction count per 1000 frames at 16 kHz (callgrind): previously committed NS 100.0M, the first quality-tuned design 150.9M, after speed-only changes 127.1M, current low-delay filterbank 68.4M. The FFT is about half of the work.
-- §4.4's 2.0x criterion therefore holds on x86 for the current build; the MIPS figure is still to be measured in CI.
+- NS throughput on x86: WebRTC baseline 18-19 MS/s, current NS 34-40 MS/s (about 1.9-2.1x). On the CI MIPS build under QEMU: baseline 0.26 MS/s, candidate 0.56 MS/s (+116%, about 2.2x); this was measured for the previous tracker, which has the same cost to within 3%.
+- Instruction count per 1000 frames at 16 kHz (callgrind): previously committed NS 100.0M, the first quality-tuned design 150.9M, after speed-only changes 127.1M, current low-delay build 70.4M. The FFT is about half of the work.
+- §4.4's 2.0x criterion held in the CI MIPS/QEMU run. The absolute figure of §4.2 (above 0.8 MS/s) is not met under QEMU, but QEMU's absolute numbers are not comparable with the real-hardware figures that criterion was derived from; a real-device measurement is outstanding.
 
 **Latency**
 - The vendor-twin NS and the current NS both delay audio by 96 samples (6.0 ms) at 16 kHz. The earlier neo filterbank delayed by 160 samples (10 ms). Replacing it cost little in quality: the ideal-mask ceiling at the policy-1 floor over 42 clips was 3.618 against 3.622, and on the development half at policy 1 the real estimator passed 22 of 34 files against 23 (per-type mean delta within 0.03).

@@ -292,28 +292,46 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 		const int32_t gain_start = gain;
 		const int multi = num_bands > 1;
 
-		for (size_t i = 0; i < run; i++) {
-			int32_t x = s_in[i];
-			int32_t a = x < 0 ? -x : x;
-			if (a > peak)
-				peak = a;
+		/* the gain is monotonic across the run: if its larger end fits the
+		 * 32-bit multiply, the common single-band loop needs no branches */
+		const int64_t gend = (int64_t)gain + (int64_t)step * (int64_t)run;
+		const int64_t gmax11 = ((int64_t)gain > gend ? (int64_t)gain : gend) >> 11;
+		if (!multi && gmax11 <= 65535) {
+			for (size_t i = 0; i < run; i++) {
+				int32_t x = s_in[i];
+				int32_t a = x < 0 ? -x : x;
+				peak = a > peak ? a : peak;
 
-			int32_t g11 = gain >> 11;
-			if (multi)
-				gains[i] = gain >> 6;
-			gain += step;
+				int32_t y = (x * (gain >> 11) + 1024) >> 11;
+				gain += step;
 
-			int32_t y;
-			if (g11 <= 65535)
-				y = (x * g11 + 1024) >> 11; /* fits 32 bits up to 30 dB */
-			else
-				y = (int32_t)(((int64_t)x * g11 + 1024) >> 11);
+				if ((uint32_t)(y + AGC_LIM_THR) > (uint32_t)(2 * AGC_LIM_THR))
+					s_out[i] = agc_out(y, limiter_on);
+				else
+					s_out[i] = (int16_t)y;
+			}
+		} else {
+			for (size_t i = 0; i < run; i++) {
+				int32_t x = s_in[i];
+				int32_t a = x < 0 ? -x : x;
+				if (a > peak)
+					peak = a;
 
-			if ((uint32_t)(y + AGC_LIM_THR) > (uint32_t)(2 * AGC_LIM_THR)) {
-				/* outside the linear range: bend or clamp */
-				s_out[i] = agc_out(y, limiter_on);
-			} else {
-				s_out[i] = (int16_t)y;
+				int32_t g11 = gain >> 11;
+				if (multi)
+					gains[i] = gain >> 6;
+				gain += step;
+
+				int32_t y;
+				if (g11 <= 65535)
+					y = (x * g11 + 1024) >> 11;
+				else
+					y = (int32_t)(((int64_t)x * g11 + 1024) >> 11);
+
+				if ((uint32_t)(y + AGC_LIM_THR) > (uint32_t)(2 * AGC_LIM_THR))
+					s_out[i] = agc_out(y, limiter_on);
+				else
+					s_out[i] = (int16_t)y;
 			}
 		}
 

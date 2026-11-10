@@ -626,7 +626,27 @@ static void ns_regressions_at_rate(int rate, void *(*create)(void), int (*set_co
 		nfree(b);
 	}
 
-	/* 5. set_config resets the state: a reused instance equals a fresh one. */
+	/* 5. A genuine rise in the noise level must be followed. Bins far above the noise
+	 * estimate raise it only slowly, which must not freeze it: noise that becomes 20 dB
+	 * louder has to be suppressed again within a few seconds, to the same depth as before. */
+	{
+		void *ns = create();
+		set_config(ns, rate, 2);
+		const int total = rate * 12;
+		float *step = malloc(total * sizeof(float)), *so = malloc(total * sizeof(float));
+		srand(21);
+		for (int i = 0; i < total; i++)
+			step[i] = ((float)(rand() % 2000) - 1000.0f) * (i < rate * 4 ? 0.1f : 1.0f);
+		ns_run(ns, proc, step, so, total, frame, 0);
+		double before = ns_rms_db(step, rate * 3, rate * 4) - ns_rms_db(so, rate * 3 + frame, rate * 4 + frame);
+		double after = ns_rms_db(step, rate * 10, rate * 12 - frame) - ns_rms_db(so, rate * 10 + frame, rate * 12);
+		ASSERT_TRUE(after > before - 6.0, "NS re-converges after the noise level rises by 20 dB");
+		free(step);
+		free(so);
+		nfree(ns);
+	}
+
+	/* 6. set_config resets the state: a reused instance equals a fresh one. */
 	{
 		void *a = create(), *b = create();
 		set_config(a, rate, 2);

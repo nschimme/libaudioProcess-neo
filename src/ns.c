@@ -34,6 +34,8 @@
 #define NS_NOISE_UPD_CAP  5.0f   /* max |Y|^2 / noise accepted by the noise update */
 #define NS_SPP_SPAN       3
 #define NS_FRAME_P_GAIN   1.5f
+#define NS_HOLD_GAMMA     10.0f  /* smoothed power / noise estimate above which a bin is treated as signal */
+#define NS_HOLD_AD        0.995f /* noise update weight for such bins (slow rise) */
 #define NS_MCRA_DELTA     28.0f   /* S/Smin ratio above which a bin is speech-like */
 
 struct modern_ns_state {
@@ -236,7 +238,12 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 		st->sub_win_counter = 0;
 
 	for (int k = 0; k < num_bins; k++) {
-		st->smooth_power[k] = alpha_p * st->smooth_power[k] + (1.0f - alpha_p) * p[k];
+		/* The first frame seeds the smoothed power with its own power, so the start-up
+		 * state does not depend on the absolute signal level (int16-range or +-1.0). */
+		if (st->frame_count == 1)
+			st->smooth_power[k] = p[k];
+		else
+			st->smooth_power[k] = alpha_p * st->smooth_power[k] + (1.0f - alpha_p) * p[k];
 		float sp = st->smooth_power[k];
 
 		if (st->frame_count <= 2) {
@@ -263,13 +270,30 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 			 * estimate does not climb through weak speech bins during an utterance. */
 			float hold = st->spp[k] > st->frame_p_prev ? st->spp[k] : st->frame_p_prev;
 			float ad = 0.95f + 0.05f * hold;
-			/* Fall quickly toward a lower power so the estimate recovers between
-			 * utterances instead of inheriting the level of preceding speech. */
-			if (p[k] < st->noise_power[k])
+			/* A bin that is far above the current noise estimate is signal, not noise:
+			 * let the estimate rise only slowly there (it still adapts to genuinely
+			 * rising noise within a few seconds). The windowed-minimum ratio above
+			 * cannot flag rapidly modulated sparse sounds, whose smoothed power never
+			 * dips far below its peaks. */
+			if (sp > NS_HOLD_GAMMA * st->noise_power[k] && ad < NS_HOLD_AD)
+				ad = NS_HOLD_AD;
+			/* The fall target depends on the frame type. In speech frames, follow
+			 * the raw power so the estimate cannot stay inflated by an utterance.
+			 * In pauses, follow the smoothed power: chasing |Y|^2 troughs there
+			 * biases the estimate low and makes fluctuating noise (babble) look
+			 * like speech. A fast fall lets it recover between utterances instead
+			 * of inheriting the level of the preceding speech. */
+			float tgt = p[k];
+			float fall_ref = st->frame_p_prev * p[k] + (1.0f - st->frame_p_prev) * sp;
+			if (fall_ref < st->noise_power[k]) {
 				ad = NS_NOISE_FALL_AD;
+				tgt = fall_ref;
+			}
 			/* Bound the update input so a speech onset (|Y|^2 far above the noise)
-			 * cannot drag the estimate up before the presence probability reacts. */
-			float pin = p[k];
+			 * cannot drag the estimate up before the presence probability reacts.
+			 * In speech frames (hold -> 1) the update may not rise at all: the cap
+			 * shrinks from NS_NOISE_UPD_CAP towards 1x the current estimate. */
+			float pin = tgt;
 			float cap = NS_NOISE_UPD_CAP * st->noise_power[k];
 			if (pin > cap)
 				pin = cap;
@@ -287,7 +311,7 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 	 * Policy 2: 18.8 dB target (+-2.0 dB)
 	 * Policy 3: > 21.0 dB target
 	 */
-	static const float floor_table[4] = { 0.450f, 0.220f, 0.075f, 0.028f };
+	static const float floor_table[4] = { 0.457f, 0.229f, 0.115f, 0.070f };
 	/* Decision-directed smoothing of the a priori SNR */
 	const float dd = 0.95f;
 

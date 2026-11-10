@@ -362,7 +362,7 @@ Findings from the audit:
 | -20 | 3.63 / 7.64 | 0.61 / 0.48 | 4 / 36 | -0.078 |
 | -15 | 7.92 / 11.99 | 0.79 / 0.61 | 7 / 171 | -0.053 |
 
-Medians over 20 clips; mode 2 shows the same pattern. The absolute part of M1 is badly calibrated: it compares an RMS level of speech with a target that both implementations apply to peaks, so the oracle itself exceeds 1.5 dB at high levels; the relative comparison is what carries the result. Overall medians: M1 3.11 against 1.05 dB; M2 0.44 against 0.23; M3 -0.027; clipped samples 207 against 11.
+Medians over 20 clips. In mode 2 the oracle itself is 3 dB below the ideal at -45 and -35 dBFS (median error 3.11 dB, HEAD 0.01 dB), and HEAD is again further from the ideal at -20 and -15 dBFS and clips more (207 against 6 samples), so mode 2 also fails M2 and M4 but the level comparison differs at low input. The absolute part of M1 is badly calibrated: it compares an RMS level of speech with a target that both implementations apply to peaks, so the oracle itself exceeds 1.5 dB at high levels; the relative comparison is what carries the result. Overall medians: M1 3.11 against 1.05 dB; M2 0.44 against 0.23; M3 -0.027; clipped samples 207 against 11.
 
 **Tone gates (1 kHz sine, mode 3, target 3).** Oracle output peak lands near -3 dBFS (RMS -6.2 dBFS) for inputs of -10 to 0 dBFS; HEAD settles at RMS -9.0 dBFS for inputs of -15 to 0 dBFS, 3 dB lower, so the §4.2 target-lock gate (within 0.5 dB of the target for -15 to -3 dBFS) is not met by HEAD. A full-scale tone clips 86 samples in HEAD (122 with gain 12) and none in the oracle (the output reaches -32768 during start-up). The gain cap is met (+9.0 dB, oracle +7.9 to +8.0).
 

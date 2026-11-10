@@ -24,7 +24,8 @@
  *    (internally limited to 54 dB).
  *  - Gain is held (not raised) while the envelope is at the noise floor or
  *    without speech, and pauses get a slow -2.3 dB attenuation, so steady
- *    noise is never boosted.
+ *    noise below about -33 dBFS is never boosted (louder signals, steady or
+ *    not, are treated as signal).
  *  - With the limiter on, the output is bent smoothly below full scale; it
  *    never reaches 32767. With the limiter off it is clamped.
  *
@@ -44,6 +45,7 @@
 #define AGC_REF_DECAY_Q  21      /* speech reference falls by 21/65536 per block (about 3 s) */
 #define AGC_FLOOR_RISE_Q 20      /* the noise floor may rise by 20/65536 per block (2.6 dB/s) */
 #define AGC_FLOOR_ADD    328     /* plus 0.01 count in Q15 so it can leave zero */
+#define AGC_LOUD_Q15     (700 << 15) /* a peak above about -33 dBFS counts as signal whatever its shape */
 #define AGC_SPEECH_RATIO 5       /* speech reference at least 5 times the floor = speech */
 #define AGC_PAUSE_PCT    22      /* envelope below 22% of the reference = pause */
 #define AGC_PAUSE_ATTEN_Q 50463  /* 0.77 (-2.3 dB) in Q16 */
@@ -200,12 +202,15 @@ static void agc_block_update(struct modern_agc *st)
 	st->speech_ref -= (int32_t)(((int64_t)st->speech_ref * AGC_REF_DECAY_Q) >> 16);
 	if (st->env > st->speech_ref)
 		st->speech_ref = st->env;
+	if (st->floor_est == 0 && st->env > 0)
+		st->floor_est = st->env; /* start from the first level seen, not from zero */
 	st->floor_est += (int32_t)(((int64_t)st->floor_est * AGC_FLOOR_RISE_Q) >> 16) + AGC_FLOOR_ADD;
 	if (st->env < st->floor_est)
 		st->floor_est = st->env;
 
 	/* speech has a wide envelope range; steady noise does not */
-	int speech = (int64_t)st->speech_ref > (int64_t)AGC_SPEECH_RATIO * st->floor_est;
+	int speech = st->speech_ref > AGC_LOUD_Q15 ||
+		     (int64_t)st->speech_ref > (int64_t)AGC_SPEECH_RATIO * st->floor_est;
 	int pause = !speech || (int64_t)st->env * 100 < (int64_t)st->speech_ref * AGC_PAUSE_PCT;
 
 	int32_t cur = st->gain_goal;

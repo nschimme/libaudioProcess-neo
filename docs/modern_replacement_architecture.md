@@ -337,7 +337,7 @@ Method: for 38 `libimp.so` builds (one per SoC and SDK version, `gtxaspec/ingeni
 | `lpf_create`, `lpf_process` | T32, T33 | yes (through a `libimp` wrapper that halves a byte count) | not yet read | unverified |
 
 Findings from the audit:
-- The header comment ties plain DRC to "T41 ZRT", but `libimp` also references it on T31 builds (T31 is the main Thingino SoC), so DRC is a live code path on the most common camera, not a niche one.
+- The header comment ties plain DRC to "T41 ZRT", but `libimp` also references it on T31 builds (T31 is the main Thingino SoC), so DRC is reachable from `libimp` on the most common camera (it is off by default), not a niche path.
 - `hs_process` argument-count mismatch and the `drc_eq_set_config` argument-count question are defects to resolve before anything is shipped that enables those effects. The latter is flagged, not confirmed: the stores were counted from one disassembly window and need a full trace.
 - Every effect is off by default on every camera, which explains how these mismatches went unnoticed.
 

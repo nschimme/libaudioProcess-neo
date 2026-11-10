@@ -4,13 +4,13 @@ CC      = $(CROSS_COMPILE)gcc
 STRIP   = $(CROSS_COMPILE)strip
 
 CFLAGS  = -std=c11 -D_GNU_SOURCE -Os -Wall -Wextra -Werror=implicit-function-declaration
-CFLAGS += -fPIC -DMIPS_FPU_LE -DWEBRTC_POSIX -Isrc
+CFLAGS += -fPIC -DMIPS_FPU_LE -Isrc
 CFLAGS += -ffunction-sections -fdata-sections -flto
 CFLAGS += -fno-asynchronous-unwind-tables -fmerge-all-constants -fno-ident
 
 LDFLAGS  = -shared -fPIC
 LDFLAGS += -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--no-as-needed -lm -lpthread -flto
-LDFLAGS += -Wl,--version-script=$(SRCDIR)/libaudioProcess.map
+LDFLAGS += -Wl,--version-script=$(SRCDIR)/libaudioProcess.map -Wl,-soname,libaudioProcess.so
 
 AR      = $(CROSS_COMPILE)ar
 
@@ -18,53 +18,12 @@ TARGET  = libaudioProcess.so
 TARGET_A = libaudioProcess.a
 SRCDIR  = src
 
-# Our modules
+# Clean-Room C11 Modules
 MOD_SRC = $(addprefix $(SRCDIR)/, \
 	aec.c agc.c ns.c hpf.c lpf.c \
 	howling.c drc.c eq.c drc_eq.c biquad.c config.c fft.c)
 
-# WebRTC AEC (Replaced by clean-room src/aec.c and src/fft.c)
-AEC_SRC =
-
-# WebRTC AGC (Replaced by clean-room src/agc.c)
-AGC_SRC =
-
-# WebRTC NS
-NS_SRC = $(addprefix $(SRCDIR)/webrtc/modules/audio_processing/ns/, \
-	ns_core.c noise_suppression.c)
-
-# WebRTC utility
-UTIL_SRC = $(addprefix $(SRCDIR)/webrtc/modules/audio_processing/utility/, \
-	delay_estimator.c delay_estimator_wrapper.c)
-
-# WebRTC common audio (Replaced fft4g.c with clean-room src/fft.c)
-COMMON_SRC = $(addprefix $(SRCDIR)/webrtc/common_audio/, \
-	ring_buffer.c)
-
-# WebRTC SPL
-SPL_SRC = $(addprefix $(SRCDIR)/webrtc/common_audio/signal_processing/, \
-	auto_correlation.c auto_corr_to_refl_coef.c \
-	complex_bit_reverse.c complex_fft.c \
-	copy_set_operations.c cross_correlation.c cross_correlation_mips.c \
-	division_operations.c dot_product_with_scale.c \
-	downsample_fast.c \
-	energy.c filter_ar.c filter_ar_fast_q12.c \
-	filter_ma_fast_q12.c get_hanning_window.c get_scaling_square.c \
-	levinson_durbin.c \
-	lpc_to_refl_coef.c min_max_operations.c min_max_operations_mips.c \
-	randomization_functions.c real_fft.c refl_coef_to_lpc.c \
-	resample.c resample_48khz.c resample_by_2.c resample_by_2_internal.c \
-	resample_fractional.c \
-	spl_init.c spl_sqrt.c spl_sqrt_floor_mips.c \
-	splitting_filter.c sqrt_of_one_minus_x_squared.c \
-	vector_scaling_operations.c)
-
-# WebRTC VAD
-VAD_SRC = $(addprefix $(SRCDIR)/webrtc/common_audio/vad/, \
-	webrtc_vad.c vad_core.c vad_filterbank.c vad_gmm.c vad_sp.c)
-
-ALL_SRC = $(MOD_SRC) $(AEC_SRC) $(AGC_SRC) $(NS_SRC) $(UTIL_SRC) \
-	  $(COMMON_SRC) $(SPL_SRC) $(VAD_SRC)
+ALL_SRC = $(MOD_SRC)
 
 OBJS = $(ALL_SRC:.c=.o)
 
@@ -80,11 +39,11 @@ $(TARGET_A): $(OBJS)
 $(SRCDIR)/%.o: $(SRCDIR)/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(SRCDIR)/webrtc/%.o: $(SRCDIR)/webrtc/%.c
-	$(CC) $(CFLAGS) -Wno-unused-parameter -c -o $@ $<
-
 clean:
 	rm -f $(OBJS) $(TARGET) $(TARGET_A)
+
+abi-check: $(TARGET)
+	@sh scripts/check_abi.sh $(TARGET) $(CROSS_COMPILE)nm
 
 size: $(TARGET)
 	@ls -lh $(TARGET)
@@ -93,7 +52,7 @@ size: $(TARGET)
 	@nm -D --defined-only $(TARGET) | grep -c ' T '
 
 test:
-	gcc -std=c11 -D_GNU_SOURCE -O2 -rdynamic -Isrc src/aec.c src/agc.c src/biquad.c src/config.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/fft.c src/webrtc/common_audio/signal_processing/copy_set_operations.c tests/unit_tests.c -ldl -lm -o tests/unit_tests_bin
+	gcc -std=c11 -D_GNU_SOURCE -O2 -rdynamic -Isrc src/aec.c src/agc.c src/ns.c src/biquad.c src/config.c src/hpf.c src/lpf.c src/drc.c src/eq.c src/drc_eq.c src/howling.c src/fft.c tests/unit_tests.c -ldl -lm -o tests/unit_tests_bin
 	./tests/unit_tests_bin
 	rm -f tests/unit_tests_bin
 

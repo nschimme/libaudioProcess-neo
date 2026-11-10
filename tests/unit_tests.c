@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include <stdio.h>
+#include <sys/mman.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -244,7 +245,7 @@ static void test_howling_guardrails(void)
 	}
 
 	double initial_rms = compute_rms_i16(buf, 0, 128);
-	audio_process_hs_process(hs, buf, n);
+	audio_process_hs_process(hs, buf, (uintptr_t)n, 0);
 
 	/* Check that howling filter stays bounded and active */
 	for (int i = 0; i < n; i++) {
@@ -258,6 +259,124 @@ static void test_howling_guardrails(void)
 
 	audio_process_hs_free(hs);
 	free(buf);
+	printf("  -> PASS\n");
+}
+
+static void hs_run(int rate, int16_t *buf, int n, int chunk, int vendor_shape)
+{
+	void *hs = audio_process_hs_create(rate, chunk);
+	for (int i = 0; i < n; i += chunk) {
+		int c = (n - i < chunk) ? n - i : chunk;
+		if (vendor_shape)
+			audio_process_hs_process(hs, buf + i, (uintptr_t)(buf + i),
+						 (uintptr_t)c * sizeof(int16_t));
+		else
+			audio_process_hs_process(hs, buf + i, (uintptr_t)c, 0);
+	}
+	audio_process_hs_free(hs);
+}
+
+static void hs_tone(int16_t *b, int n, int rate, double hz)
+{
+	unsigned seed = 1;
+	for (int i = 0; i < n; i++) {
+		seed = seed * 1103515245u + 12345u;
+		double noise = (double)((int)((seed >> 16) & 0x7fff) - 16384) * 0.02;
+		b[i] = (int16_t)(12000.0 * sin(2.0 * M_PI * hz * i / rate) + noise);
+	}
+}
+
+/* Test 6b: HS must work for any call length and either call shape (regression:
+ * it used to ignore everything but whole 128-sample blocks and did nothing
+ * for 80-sample calls at 8 kHz). */
+static void test_howling_call_shapes(void)
+{
+	printf("Running test_howling_call_shapes...\n");
+	const int rates[2] = {8000, 16000};
+	const int chunks[2] = {80, 160}; /* one 10 ms call, as libimp slices it */
+
+	for (int r = 0; r < 2; r++) {
+		int rate = rates[r], n = rate * 3;
+		int16_t *orig = malloc(n * sizeof(int16_t));
+		int16_t *ref = malloc(n * sizeof(int16_t));
+		int16_t *b = malloc(n * sizeof(int16_t));
+		hs_tone(orig, n, rate, 1000.0);
+
+		/* steady-state attenuation with the real call length */
+		memcpy(b, orig, n * sizeof(int16_t));
+		hs_run(rate, b, n, chunks[r], 0);
+		double before = compute_rms_i16(orig, n - 2000, n);
+		double after = compute_rms_i16(b, n - 2000, n);
+		ASSERT_TRUE(20.0 * log10(before / (after > 1.0 ? after : 1.0)) > 3.0,
+			    "HS attenuates a steady tone with 10 ms calls");
+
+		/* output must not depend on how the stream is cut into calls */
+		memcpy(ref, orig, n * sizeof(int16_t));
+		hs_run(rate, ref, n, n, 0);
+		const int cuts[4] = {80, 160, 100, 333};
+		for (int c = 0; c < 4; c++) {
+			memcpy(b, orig, n * sizeof(int16_t));
+			hs_run(rate, b, n, cuts[c], 0);
+			ASSERT_TRUE(memcmp(b, ref, n * sizeof(int16_t)) == 0,
+				    "HS output independent of call size");
+		}
+
+		/* vendor shape (handle, buf, buf, bytes) equals the original shape */
+		memcpy(b, orig, n * sizeof(int16_t));
+		hs_run(rate, b, n, chunks[r], 1);
+		ASSERT_TRUE(memcmp(b, ref, n * sizeof(int16_t)) == 0,
+			    "HS vendor call shape matches the sample-count shape");
+
+		free(orig); free(ref); free(b);
+	}
+	/* one call with a very large sample count, as the throughput benchmark makes */
+	{
+		const int big = 131072;
+		int16_t *o = malloc(big * sizeof(int16_t));
+		int16_t *r = malloc(big * sizeof(int16_t));
+		hs_tone(o, big, 16000, 1000.0);
+		memcpy(r, o, big * sizeof(int16_t));
+		hs_run(16000, r, big, big, 0);
+		int16_t *c = malloc(big * sizeof(int16_t));
+		memcpy(c, o, big * sizeof(int16_t));
+		hs_run(16000, c, big, 160, 0);
+		ASSERT_TRUE(memcmp(c, r, big * sizeof(int16_t)) == 0,
+			    "HS handles one call with a count above 65536");
+		free(o); free(r); free(c);
+	}
+	printf("  -> PASS\n");
+}
+
+/* Regression: on MIPS32 a heap buffer can sit below 16 MB. The vendor call
+ * (handle, buf, buf, bytes) must still be read as an in-place call. */
+static void test_howling_low_address(void)
+{
+	printf("Running test_howling_low_address...\n");
+	void *want = (void *)0x00600000;
+	int n = 16000;
+	int16_t *low = mmap(want, 65536, PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (low == MAP_FAILED || low != want) {
+		printf("  [SKIP - cannot map a buffer below 16 MB here]\n");
+		return;
+	}
+	int16_t *ref = malloc(n * sizeof(int16_t));
+	int16_t *orig = malloc(n * sizeof(int16_t));
+	hs_tone(orig, n, 16000, 1000.0);
+	memcpy(ref, orig, n * sizeof(int16_t));
+	hs_run(16000, ref, n, 160, 0);
+
+	/* only 32 KB fits in the mapping: compare the first 16000 samples in pieces */
+	void *hs = audio_process_hs_create(16000, 160);
+	memcpy(low, orig, 16000 * sizeof(int16_t));
+	for (int i = 0; i < n; i += 160)
+		audio_process_hs_process(hs, low + i, (uintptr_t)(low + i), 160 * sizeof(int16_t));
+	audio_process_hs_free(hs);
+	/* the buffer is 32000 bytes of the 64 KB mapping, so samples stayed in bounds */
+	ASSERT_TRUE(memcmp(low, ref, n * sizeof(int16_t)) == 0,
+		    "HS vendor call shape works for a buffer below 16 MB");
+	munmap(low, 65536);
+	free(ref); free(orig);
 	printf("  -> PASS\n");
 }
 
@@ -363,6 +482,190 @@ static void test_agc_guardrails(void)
 	printf("  -> PASS\n");
 }
 
+static void agc_modulated(int16_t *x, int n)
+{
+	unsigned seed = 7;
+	for (int i = 0; i < n; i++) {
+		seed = seed * 1103515245u + 12345u;
+		double env = 0.5 + 0.5 * sin(2.0 * M_PI * 1.5 * i / 16000.0);
+		double noise = (double)((int)((seed >> 16) & 0x7fff) - 16384) * 0.03;
+		x[i] = (int16_t)(5000.0 * env * sin(2.0 * M_PI * 400.0 * i / 16000.0) + noise);
+	}
+}
+
+static void agc_run(int16_t *buf, int n, int chunk, int target, int cap, int limiter)
+{
+	void *a = audio_process_agc_create();
+	WebRtcAgcConfig cfg = { .targetLevelDbfs = (int16_t)target, .compressionGaindB = (int16_t)cap,
+				.limiterEnable = (uint8_t)limiter };
+	audio_process_agc_set_config(a, 0, 255, 2, 16000, cfg);
+	int32_t mic = 100;
+	for (int i = 0; i < n; i += chunk) {
+		int c = (n - i < chunk) ? n - i : chunk;
+		const int16_t *ip = buf + i;
+		int16_t *op = buf + i;
+		uint8_t sat = 0;
+		audio_process_agc_process(a, &ip, 1, (size_t)c, &op, mic, &mic, 0, &sat);
+	}
+	audio_process_agc_free(a);
+}
+
+/* Test 8b: AGC regressions found by the evaluation against the shipped
+ * (WebRTC) AGC: level lock, rail samples, call-size dependence, remainders,
+ * and gain rising in pauses. */
+static void test_agc_regressions(void)
+{
+	printf("Running test_agc_regressions...\n");
+	const int n = 16000 * 4;
+	int16_t *x = malloc(n * sizeof(int16_t));
+	int16_t *ref = malloc(n * sizeof(int16_t));
+
+	/* 1. a steady tone settles with its peak at -target dBFS (within 0.5 dB) */
+	for (int peak_db = -15; peak_db <= -3; peak_db += 4) {
+		double amp = 32767.0 * pow(10.0, peak_db / 20.0);
+		for (int i = 0; i < n; i++)
+			x[i] = (int16_t)lrint(amp * sin(2.0 * M_PI * 1000.0 * i / 16000.0));
+		agc_run(x, n, 160, 3, 12, 1);
+		int16_t mx = 0;
+		for (int i = n - 16000; i < n; i++)
+			if (abs(x[i]) > mx) mx = (int16_t)abs(x[i]);
+		double peak = 20.0 * log10((double)mx / 32767.0);
+		ASSERT_TRUE(fabs(peak - (-3.0)) <= 0.5, "AGC tone peak locks at -target dBFS within 0.5 dB");
+	}
+
+	/* 2. a full-scale tone never reaches the rails, start-up included */
+	for (int i = 0; i < n; i++)
+		x[i] = (int16_t)lrint(32767.0 * sin(2.0 * M_PI * 1000.0 * i / 16000.0));
+	agc_run(x, n, 160, 3, 12, 1);
+	for (int i = 0; i < n; i++)
+		ASSERT_TRUE(x[i] < 32767 && x[i] > -32768, "AGC output stays below the rails");
+
+	/* 3. output does not depend on how the stream is cut into calls, and a
+	 * remainder shorter than a millisecond is processed too */
+	agc_modulated(ref, n);
+	agc_run(ref, n, n, 10, 9, 1);
+	const int cuts[5] = {80, 160, 480, 100, 333};
+	for (int c = 0; c < 5; c++) {
+		agc_modulated(x, n);
+		agc_run(x, n, cuts[c], 10, 9, 1);
+		ASSERT_TRUE(memcmp(x, ref, n * sizeof(int16_t)) == 0, "AGC output independent of call size");
+	}
+
+	/* 4. a pause must not raise the gain: after loud-ish speech, a quiet
+	 * noise bed is not amplified beyond the speech gain */
+	unsigned seed = 11;
+	for (int i = 0; i < n; i++) {
+		seed = seed * 1103515245u + 12345u;
+		double noise = (double)((int)((seed >> 16) & 0x7fff) - 16384) * 0.004; /* about -62 dBFS */
+		double speech = (i < 2 * 16000) ? 3000.0 * sin(2.0 * M_PI * 300.0 * i / 16000.0) : 0.0;
+		x[i] = (int16_t)(speech + noise);
+	}
+	memcpy(ref, x, n * sizeof(int16_t));
+	agc_run(x, n, 160, 3, 12, 1);
+	double rin = compute_rms_i16(ref, 3 * 16000, n);
+	double rout = compute_rms_i16(x, 3 * 16000, n);
+	double sp_in = compute_rms_i16(ref, 16000, 2 * 16000);
+	double sp_out = compute_rms_i16(x, 16000, 2 * 16000);
+	ASSERT_TRUE(rout / rin <= (sp_out / sp_in) * 1.05, "AGC does not raise the noise bed above the speech gain");
+
+	/* 6. a gain above 30 dB (the 64-bit multiply path) is applied exactly:
+	 * quiet bursts, so the signal reads as speech and not as steady noise */
+	for (int i = 0; i < n; i++)
+		x[i] = (int16_t)(((i % 19200) < 6400)
+				 ? lrint(100.0 * sin(2.0 * M_PI * 500.0 * i / 16000.0)) : 0);
+	agc_run(x, n, 160, 3, 40, 1);
+	{
+		int mx = 0;
+		for (int i = n - 19200; i < n; i++)
+			if (abs(x[i]) > mx) mx = abs(x[i]);
+		double gain_db = 20.0 * log10((double)mx / 100.0);
+		ASSERT_TRUE(gain_db > 30.5 && gain_db <= 40.5, "AGC reaches a gain above 30 dB on quiet bursts");
+	}
+
+	/* 7. set_config is harmless: twice before process equals once, a call
+	 * on a running stream with the same settings changes nothing, and a
+	 * change of target mid-stream ramps instead of stepping */
+	{
+		WebRtcAgcConfig c12 = { .targetLevelDbfs = 3, .compressionGaindB = 12, .limiterEnable = 1 };
+		WebRtcAgcConfig c10 = { .targetLevelDbfs = 10, .compressionGaindB = 12, .limiterEnable = 1 };
+		int16_t *u = malloc(n * sizeof(int16_t));
+		int16_t *v = malloc(n * sizeof(int16_t));
+		int16_t *w = malloc(n * sizeof(int16_t));
+		agc_modulated(u, n);
+		memcpy(v, u, n * sizeof(int16_t));
+		memcpy(w, u, n * sizeof(int16_t));
+		void *a1 = audio_process_agc_create();
+		void *a2 = audio_process_agc_create();
+		void *a3 = audio_process_agc_create();
+		audio_process_agc_set_config(a1, 0, 255, 2, 16000, c12);
+		audio_process_agc_set_config(a2, 0, 255, 2, 16000, c12);
+		audio_process_agc_set_config(a2, 0, 255, 2, 16000, c12);
+		audio_process_agc_set_config(a3, 0, 255, 2, 16000, c12);
+		int32_t mic = 100;
+		uint8_t sat = 0;
+		for (int i = 0; i < n; i += 160) {
+			const int16_t *ip;
+			int16_t *op;
+			ip = u + i; op = u + i;
+			audio_process_agc_process(a1, &ip, 1, 160, &op, mic, &mic, 0, &sat);
+			ip = v + i; op = v + i;
+			audio_process_agc_process(a2, &ip, 1, 160, &op, mic, &mic, 0, &sat);
+			if (i == n / 2)
+				audio_process_agc_set_config(a3, 0, 255, 2, 16000, c12); /* mid-stream, same settings */
+			ip = w + i; op = w + i;
+			audio_process_agc_process(a3, &ip, 1, 160, &op, mic, &mic, 0, &sat);
+		}
+		ASSERT_TRUE(memcmp(u, v, n * sizeof(int16_t)) == 0, "two set_config calls equal one");
+		ASSERT_TRUE(memcmp(u, w, n * sizeof(int16_t)) == 0, "set_config with the same settings mid-stream changes nothing");
+		audio_process_agc_free(a1); audio_process_agc_free(a2); audio_process_agc_free(a3);
+
+		/* target 3 -> 10 mid-stream on a steady tone: the 1 ms peaks fall as a ramp */
+		void *a4 = audio_process_agc_create();
+		audio_process_agc_set_config(a4, 0, 255, 2, 16000, c12);
+		for (int i = 0; i < n; i++)
+			u[i] = (int16_t)lrint(3000.0 * sin(2.0 * M_PI * 700.0 * i / 16000.0));
+		for (int i = 0; i < n; i += 160) {
+			const int16_t *ip = u + i;
+			int16_t *op = u + i;
+			if (i == n / 2)
+				audio_process_agc_set_config(a4, 0, 255, 2, 16000, c10);
+			audio_process_agc_process(a4, &ip, 1, 160, &op, mic, &mic, 0, &sat);
+		}
+		audio_process_agc_free(a4);
+		double worst = 1.0, prev = 0.0;
+		for (int b = n / 2 - 1600; b < n / 2 + 3200; b += 16) {
+			int mx = 1;
+			for (int k = 0; k < 16; k++)
+				if (abs(u[b + k]) > mx) mx = abs(u[b + k]);
+			if (prev > 0.0 && mx / prev < worst) worst = mx / prev;
+			prev = mx;
+		}
+		ASSERT_TRUE(worst > 0.6, "a target change mid-stream ramps and does not step");
+		free(u); free(v); free(w);
+	}
+
+	/* 5. stationary noise alone (most of a camera's life) is never boosted,
+	 * even with a large gain cap */
+	{
+		const int m = 16000 * 10;
+		int16_t *nz = malloc(m * sizeof(int16_t));
+		int16_t *nr = malloc(m * sizeof(int16_t));
+		unsigned s5 = 3;
+		for (int i = 0; i < m; i++) {
+			s5 = s5 * 1103515245u + 12345u;
+			nz[i] = (int16_t)(((int)((s5 >> 16) & 0x7fff) - 16384) * 0.0049); /* about -60 dBFS rms */
+		}
+		memcpy(nr, nz, m * sizeof(int16_t));
+		agc_run(nz, m, 160, 3, 12, 1);
+		ASSERT_TRUE(compute_rms_i16(nz, m - 48000, m) <= compute_rms_i16(nr, m - 48000, m) * 1.0,
+			    "AGC does not boost stationary noise");
+		free(nz); free(nr);
+	}
+
+	free(x); free(ref);
+	printf("  -> PASS\n");
+}
+
 /* Test 9: NS (Noise Suppression) E2E Regression Tests */
 static void test_ns_guardrails(void)
 {
@@ -386,30 +689,333 @@ static void test_ns_guardrails(void)
 
 	int res = fn_ns_set_config(ns, 16000, 2); /* policy 2 = aggressive */
 	ASSERT_TRUE(res == 0, "ns set config");
+
+	/* Accepted values match the vendor library: only 8/16/32/48 kHz and policies 0-3,
+	 * with the result normalised to exactly 0 or -1. */
+	{
+		int ok_rates[] = {8000, 16000, 32000, 48000}, bad_rates[] = {0, 11025, 22050, 24000, 44100, 96000, -16000};
+		for (int i = 0; i < 4; i++)
+			for (int p = 0; p <= 3; p++)
+				ASSERT_TRUE(fn_ns_set_config(ns, ok_rates[i], p) == 0, "ns accepts 8/16/32/48 kHz with policy 0-3");
+		for (int i = 0; i < 7; i++)
+			ASSERT_TRUE(fn_ns_set_config(ns, bad_rates[i], 2) == -1, "ns rejects unsupported sample rates with -1");
+		ASSERT_TRUE(fn_ns_set_config(ns, 16000, -1) == -1, "ns rejects negative policy with -1");
+		ASSERT_TRUE(fn_ns_set_config(ns, 16000, 4) == -1, "ns rejects policy > 3 with -1");
+		ASSERT_TRUE(fn_ns_set_config(NULL, 16000, 2) == -1, "ns set_config on NULL returns -1");
+		ASSERT_TRUE(fn_ns_set_config(ns, 16000, 2) == 0, "ns usable again after rejected configs");
+	}
 	if (fn_ns_get_config) fn_ns_get_config();
 
-	/* E2E Test: Stationary noise suppression convergence */
-	float in_buf[160];
-	float out_buf[160];
-	const float *in_ptr = in_buf;
-	float *out_ptr = out_buf;
-
-	double initial_noise_rms = 0.0;
-	double final_noise_rms = 0.0;
-
-	for (int f = 0; f < 50; f++) {
-		for (int i = 0; i < 160; i++) {
-			in_buf[i] = ((float)(rand() % 2000) - 1000.0f) / 10000.0f;
+	/* Multi-rate & multi-policy guardrail verification */
+	/* Frame contract (libimp hands over 160-float band buffers, 80 at 8 kHz):
+	 *  - one band per call at every rate, 160 samples (80 at 8 kHz), and
+	 *  - WebRTC-style pre-split bands (2 at 32 kHz, 3 at 48 kHz), also 160 each. */
+	struct { int rate; int bands; } cases[] = {
+		{8000, 1}, {16000, 1}, {32000, 1}, {48000, 1}, {32000, 2}, {48000, 3}
+	};
+	for (int r = 0; r < 6; r++) {
+		int rate = cases[r].rate;
+		int num_bands = cases[r].bands;
+		int frame_len = (rate == 8000) ? 80 : 160;
+		float *in_f[3], *out_f[3];
+		const float *inp[3];
+		float *outp[3];
+		for (int b = 0; b < num_bands; b++) {
+			/* Exactly one band long: an over-read/over-write shows up under ASan */
+			in_f[b] = malloc(frame_len * sizeof(float));
+			out_f[b] = malloc(frame_len * sizeof(float));
+			inp[b] = in_f[b];
+			outp[b] = out_f[b];
 		}
-		if (f == 0) initial_noise_rms = compute_rms_f32(in_buf, 0, 160);
-		fn_ns_process(ns, &in_ptr, 1, &out_ptr);
-		if (f == 49) final_noise_rms = compute_rms_f32(out_buf, 0, 160);
+
+		for (int p = 0; p <= 3; p++) {
+			int set_rc = fn_ns_set_config(ns, rate, p);
+			ASSERT_TRUE(set_rc == 0, "ns set config multi-rate");
+
+			double sum_in = 0.0, sum_out = 0.0, hb_in = 0.0, hb_out = 0.0;
+			double su_in = 0.0, su_out = 0.0; /* start-up window (frames 30..59) */
+			srand(100 + r * 10 + p);
+			for (int f = 0; f < 260; f++) {
+				for (int b = 0; b < num_bands; b++)
+					for (int i = 0; i < frame_len; i++)
+						in_f[b][i] = ((float)(rand() % 2000) - 1000.0f) / 10000.0f;
+				fn_ns_process(ns, inp, num_bands, outp);
+				if (f >= 30 && f < 60) {
+					for (int i = 0; i < frame_len; i++) {
+						su_in += in_f[0][i] * in_f[0][i];
+						su_out += out_f[0][i] * out_f[0][i];
+					}
+				}
+				if (f >= 200) {
+					for (int i = 0; i < frame_len; i++) {
+						sum_in += in_f[0][i] * in_f[0][i];
+						sum_out += out_f[0][i] * out_f[0][i];
+					}
+					for (int b = 1; b < num_bands; b++)
+						for (int i = 0; i < frame_len; i++) {
+							hb_in += in_f[b][i] * in_f[b][i];
+							hb_out += out_f[b][i] * out_f[b][i];
+						}
+				}
+			}
+			double in_rms = sqrt(sum_in / (60 * frame_len));
+			double out_rms = sqrt(sum_out / (60 * frame_len));
+			double su_atten = 10.0 * log10((su_in + 1e-30) / (su_out + 1e-30));
+			double atten = 20.0 * log10(in_rms / (out_rms > 1e-9 ? out_rms : 1e-9));
+
+			/* Check acceptance gates matching and beating baseline oracle:
+			 * Policy 0: 6.8 dB target (+- 1.0 dB)
+			 * Policy 1: 12.8 dB target (+- 1.5 dB)
+			 * Policy 2: 18.8 dB target (+- 2.0 dB)
+			 * Policy 3: > 21.0 dB target
+			 */
+			/* Steady-state (frames 200..259) must meet the oracle gates exactly; the
+			 * start-up window (frames 30..59) depends on the noise realization and
+			 * only has to show that suppression has clearly begun (loose sanity bound). */
+			ASSERT_TRUE(su_atten >= (p == 0 ? 3.5 : p == 1 ? 8.0 : 12.0), "Start-up attenuation sanity");
+			if (p == 0) ASSERT_TRUE(atten >= 5.5 && atten <= 8.0, "Policy 0 attenuation guardrail");
+			else if (p == 1) ASSERT_TRUE(atten >= 11.0 && atten <= 14.5, "Policy 1 attenuation guardrail");
+			else if (p == 2) ASSERT_TRUE(atten >= 16.5 && atten <= 21.0, "Policy 2 attenuation guardrail");
+			else if (p == 3) ASSERT_TRUE(atten >= 21.0, "Policy 3 attenuation guardrail");
+
+			/* Upper subbands must be attenuated like the low band (gain derived from it),
+			 * not by an unrelated constant, and must stay finite. */
+			if (num_bands > 1) {
+				double hb_att = 20.0 * log10(sqrt(hb_in) / (sqrt(hb_out) > 1e-9 ? sqrt(hb_out) : 1e-9));
+				ASSERT_TRUE(fabs(hb_att - atten) <= 6.0, "High-band attenuation tracks low band");
+			}
+		}
+
+		/* High bands must be a delayed, scaled copy of the input, delayed by the same
+		 * ov = 3/5 of a block (96 samples at 16 kHz) as the low band: an impulse at
+		 * index 5 of a block comes out at index 5 + ov, not at index 5. */
+		if (num_bands > 1) {
+			int ov = (frame_len * 3) / 5;
+			fn_ns_set_config(ns, rate, 0);
+			for (int f = 0; f < 80; f++) {
+				for (int b = 0; b < num_bands; b++)
+					for (int i = 0; i < frame_len; i++)
+						in_f[b][i] = (b == 1 && f == 40 && i == 5) ? 0.5f : 0.0f;
+				fn_ns_process(ns, inp, num_bands, outp);
+				if (f == 40) {
+					ASSERT_TRUE(fabsf(out_f[1][5]) < 1e-6f, "High band is not passed through undelayed");
+					ASSERT_TRUE(fabsf(out_f[1][5 + ov]) > 0.05f, "High band impulse arrives ov samples later");
+				}
+			}
+		}
+		for (int b = 0; b < num_bands; b++) {
+			free(in_f[b]);
+			free(out_f[b]);
+		}
 	}
 
-	double snr_gain_db = 20.0 * log10(initial_noise_rms / (final_noise_rms > 1e-6 ? final_noise_rms : 1e-6));
-	ASSERT_TRUE(snr_gain_db > 5.0, "NS achieves > 5 dB stationary noise attenuation");
-
 	fn_ns_free(ns);
+	printf("  -> PASS\n");
+}
+
+/* Regression guards for failures found while tuning the NS. Each one protects a
+ * behaviour a real caller depends on, using synthetic signals that need no
+ * dataset:
+ *  - speech passes through nearly untouched,
+ *  - speech after digital silence is not mistaken for noise,
+ *  - the result does not depend on the sample scale,
+ *  - in-place processing equals separate buffers,
+ *  - set_config fully resets the state (create-per-enable). */
+typedef void (*ns_proc_fn)(void *, const float *const *, int, float *const *);
+
+/* Voiced-speech-like test signal: 12 harmonics of 140 Hz under a 4 Hz raised-cosine
+ * envelope, in int16-range floats. */
+static float ns_speech_sample(int n, int rate, float amp)
+{
+	double t = (double)n / rate, v = 0.0;
+	for (int h = 1; h <= 12; h++)
+		v += sin(2.0 * M_PI * 140.0 * h * t) / h;
+	double env = 0.5 * (1.0 - cos(2.0 * M_PI * 4.0 * t));
+	return (float)(amp * env * v);
+}
+
+static void ns_run(void *ns, ns_proc_fn proc, const float *in, float *out, int n, int frame, int inplace)
+{
+	static float work[480];
+	for (int i = 0; i + frame <= n; i += frame) {
+		memcpy(work, in + i, frame * sizeof(float));
+		const float *ip = work;
+		float tmp[480];
+		float *op = inplace ? work : tmp;
+		proc(ns, &ip, 1, &op);
+		memcpy(out + i, op, frame * sizeof(float));
+	}
+}
+
+static double ns_rms_db(const float *x, int from, int to)
+{
+	double s = 0.0;
+	for (int i = from; i < to; i++)
+		s += (double)x[i] * x[i];
+	return 10.0 * log10(s / (to - from) + 1e-30);
+}
+
+static void ns_regressions_at_rate(int rate, void *(*create)(void), int (*set_config)(void *, int, int),
+				   ns_proc_fn proc, int (*nfree)(void *))
+{
+	const int frame = (rate == 8000) ? 80 : 160, N = rate * 4;
+	float *sig = malloc(N * sizeof(float)), *out = malloc(N * sizeof(float));
+	float *out2 = malloc(N * sizeof(float)), *scaled = malloc(N * sizeof(float));
+
+	/* 1. Speech in light noise (about 35 dB SNR) must stay close to unity. The first
+	 * second is noise only, so the tracker has something to learn. */
+	srand(11);
+	for (int i = 0; i < N; i++)
+		sig[i] = ((float)(rand() % 2000) - 1000.0f) * 0.03f + (i >= rate ? ns_speech_sample(i, rate, 3000.0f) : 0.0f);
+	for (int pol = 0; pol <= 2; pol++) {
+		void *ns = create();
+		set_config(ns, rate, pol);
+		ns_run(ns, proc, sig, out, N, frame, 0);
+		/* output lags the input by one frame */
+		double din = ns_rms_db(sig, rate + 2 * rate / 2, N - frame);
+		double dout = ns_rms_db(out, rate + 2 * rate / 2 + frame, N);
+		ASSERT_TRUE(din - dout < 3.0, "NS passes speech in light noise within 3 dB");
+		nfree(ns);
+	}
+
+	/* 2. Speech after digital silence. Pauses of exact zeros drove the noise estimate to
+	 * zero and the next utterance was cut by 13-20 dB (seen on the TCD echo clips). */
+	memset(sig, 0, N * sizeof(float));
+	for (int i = 2 * rate; i < N; i++)
+		sig[i] = ns_speech_sample(i - 2 * rate, rate, 3000.0f);
+	{
+		void *ns = create();
+		set_config(ns, rate, 2);
+		ns_run(ns, proc, sig, out, N, frame, 0);
+		int a = 2 * rate + rate / 2, b = N - frame;
+		ASSERT_TRUE(ns_rms_db(sig, a, b) - ns_rms_db(out, a + frame, b + frame) < 3.0,
+			    "NS does not cut speech that follows digital silence");
+		nfree(ns);
+	}
+
+	/* 3. Scale invariance: int16-range input and the same signal scaled by 1/32768. */
+	srand(12);
+	for (int i = 0; i < N; i++)
+		sig[i] = ((float)(rand() % 2000) - 1000.0f) * 0.1f + ns_speech_sample(i, rate, 2000.0f);
+	for (int i = 0; i < N; i++)
+		scaled[i] = sig[i] / 32768.0f;
+	{
+		void *a = create(), *b = create();
+		set_config(a, rate, 2);
+		set_config(b, rate, 2);
+		ns_run(a, proc, sig, out, N, frame, 0);
+		ns_run(b, proc, scaled, out2, N, frame, 0);
+		double sg = 0.0, er = 0.0;
+		for (int i = 0; i < N; i++) {
+			double x = out[i] / 32768.0, d = x - out2[i];
+			sg += x * x;
+			er += d * d;
+		}
+		ASSERT_TRUE(10.0 * log10((sg + 1e-30) / (er + 1e-30)) > 40.0,
+			    "NS result is independent of sample scale (>40 dB agreement)");
+		nfree(a);
+		nfree(b);
+	}
+
+	/* 4. In-place processing equals separate buffers, bit for bit. */
+	{
+		void *a = create(), *b = create();
+		set_config(a, rate, 2);
+		set_config(b, rate, 2);
+		ns_run(a, proc, sig, out, N, frame, 0);
+		ns_run(b, proc, sig, out2, N, frame, 1);
+		ASSERT_TRUE(memcmp(out, out2, N * sizeof(float)) == 0, "NS in-place equals separate buffers");
+		nfree(a);
+		nfree(b);
+	}
+
+	/* 5. A genuine rise in the noise level must be followed. Bins far above the noise
+	 * estimate raise it only slowly, which must not freeze it: noise that becomes 20 dB
+	 * louder has to be suppressed again within a few seconds, to the same depth as before. */
+	{
+		void *ns = create();
+		set_config(ns, rate, 2);
+		const int total = rate * 12;
+		float *step = malloc(total * sizeof(float)), *so = malloc(total * sizeof(float));
+		srand(21);
+		for (int i = 0; i < total; i++)
+			step[i] = ((float)(rand() % 2000) - 1000.0f) * (i < rate * 4 ? 0.1f : 1.0f);
+		ns_run(ns, proc, step, so, total, frame, 0);
+		double before = ns_rms_db(step, rate * 3, rate * 4) - ns_rms_db(so, rate * 3 + frame, rate * 4 + frame);
+		double after = ns_rms_db(step, rate * 10, rate * 12 - frame) - ns_rms_db(so, rate * 10 + frame, rate * 12);
+		ASSERT_TRUE(after > before - 6.0, "NS re-converges after the noise level rises by 20 dB");
+		free(step);
+		free(so);
+		nfree(ns);
+	}
+
+	/* 6. The output must stay inside the int16 range even for full-scale, clipped input.
+	 * libimp converts our float output back with a truncation and a 16-bit store and no
+	 * clamp, so any value beyond +-32767 would wrap into a full-scale click. The WebRTC
+	 * NS this replaces saturates internally, so the caller never needed to. */
+	{
+		void *ns = create();
+		set_config(ns, rate, 2);
+		const int total = rate * 6;
+		float *loud = malloc(total * sizeof(float)), *lo = malloc(total * sizeof(float));
+		unsigned seed = 33;
+		for (int i = 0; i < total; i++) {
+			double t = (double)i / rate, v = 0.0;
+			for (int h = 1; h <= 10; h++)
+				v += sin(2.0 * M_PI * 150.0 * h * t + h * 0.3) / h;
+			int burst = (i / 6400) % 2 == 0 && i > 3200;   /* bursts of loud voice */
+			double s = burst ? 60000.0 * 0.6 * v : 0.0;
+			s += ((double)(rand_r(&seed) % 2000) - 1000.0) * 0.4;
+			loud[i] = (float)(s > 32767.0 ? 32767.0 : (s < -32768.0 ? -32768.0 : s));
+		}
+		ns_run(ns, proc, loud, lo, total, frame, 0);
+		float peak = 0.0f;
+		for (int i = 0; i < total; i++)
+			if (fabsf(lo[i]) > peak)
+				peak = fabsf(lo[i]);
+		ASSERT_TRUE(peak <= 32768.0f, "NS output stays inside the int16 range for full-scale clipped input");
+		free(loud);
+		free(lo);
+		nfree(ns);
+	}
+
+	/* 7. set_config resets the state: a reused instance equals a fresh one. */
+	{
+		void *a = create(), *b = create();
+		set_config(a, rate, 2);
+		ns_run(a, proc, sig, out, N, frame, 0); /* dirty the state */
+		set_config(a, rate, 2);
+		set_config(b, rate, 2);
+		ns_run(a, proc, sig, out, N, frame, 0);
+		ns_run(b, proc, sig, out2, N, frame, 0);
+		ASSERT_TRUE(memcmp(out, out2, N * sizeof(float)) == 0, "NS set_config fully resets the state");
+		nfree(a);
+		nfree(b);
+	}
+
+	free(sig);
+	free(out);
+	free(out2);
+	free(scaled);
+}
+
+
+static void test_ns_regressions(void)
+{
+	printf("Running test_ns_regressions (E2E)...\n");
+	void *handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+	if (!handle) handle = dlopen("./libaudioProcess.so", RTLD_NOW | RTLD_GLOBAL);
+	void *(*create)(void) = dlsym(handle, "audio_process_ns_create");
+	int (*set_config)(void *, int, int) = dlsym(handle, "audio_process_ns_set_config");
+	ns_proc_fn proc = dlsym(handle, "audio_process_ns_process");
+	int (*nfree)(void *) = dlsym(handle, "audio_process_ns_free");
+	if (!create || !set_config || !proc || !nfree) {
+		printf("  [SKIP - NS symbols not in binary link]\n");
+		return;
+	}
+
+	ns_regressions_at_rate(16000, create, set_config, proc, nfree);
+	ns_regressions_at_rate(8000, create, set_config, proc, nfree);
 	printf("  -> PASS\n");
 }
 
@@ -464,6 +1070,86 @@ static void test_aec_guardrails(void)
 
 	int res = fn_aec_free(aec);
 	ASSERT_TRUE(res == 0, "aec free");
+	printf("  -> PASS\n");
+}
+
+/* speech-like broadband far end: coloured noise with syllable gating, so
+ * that the echo path delay is unambiguous (a harmonic or tonal signal fits
+ * every multiple of its period) */
+static void aec_far_signal(int16_t *x, int n, int rate, unsigned seed)
+{
+	double lp = 0.0;
+	for (int i = 0; i < n; i++) {
+		double ts = (double)i / rate;
+		double gate = 0.5 + 0.5 * sin(2.0 * M_PI * 2.5 * ts);
+		seed = seed * 1103515245u + 12345u;
+		double noise = (double)((int)((seed >> 16) & 0x7fff) - 16384) / 16384.0;
+		lp = 0.6 * lp + 0.4 * noise;      /* one-pole colouring */
+		x[i] = (int16_t)(9000.0 * gate * lp);
+	}
+}
+
+/* ERLE of the AEC on a delayed, attenuated copy of a broadband far end */
+static double aec_erle(int rate, int delay_ms)
+{
+	const int n = rate * 8;
+	const int s10 = rate / 100;
+	int16_t *far = malloc(n * sizeof(int16_t));
+	int16_t *mic = malloc(n * sizeof(int16_t));
+	int16_t *ref = malloc(n * sizeof(int16_t));
+	aec_far_signal(far, n, rate, 17);
+	int d = rate * delay_ms / 1000;
+	unsigned seed = 5;
+	for (int i = 0; i < n; i++) {
+		seed = seed * 1103515245u + 12345u;
+		double noise = (double)((int)((seed >> 16) & 0x7fff) - 16384) / 16384.0 * 10.0;
+		mic[i] = (int16_t)((i >= d ? 0.5 * far[i - d] : 0.0) + noise);
+	}
+	memcpy(ref, mic, n * sizeof(int16_t));
+	struct aec_handle *h = (struct aec_handle *)audio_process_aec_create(rate, NULL);
+	for (int f = 0; f + 2 <= n / s10; f += 2) {
+		struct aec_frame frm = { .far = far + f * s10, .near = mic + f * s10, .num_bytes = 2 * s10 * 2 };
+		audio_process_aec_process(h, &frm);
+	}
+	audio_process_aec_free(h);
+	double ein = 0.0, eout = 0.0;
+	for (int i = n - 3 * rate; i < n; i++) {
+		if (abs(far[i]) > 800) {
+			ein += (double)ref[i] * ref[i];
+			eout += (double)mic[i] * mic[i];
+		}
+	}
+	free(far); free(mic); free(ref);
+	return 10.0 * log10(ein / (eout > 1.0 ? eout : 1.0));
+}
+
+/* Test 10b: the AEC cancels a broadband echo across realistic path delays
+ * (the single-tone test above cannot tell a delay from its multiples), and
+ * leaves the near end alone when the far end is silent */
+static void test_aec_delay_paths(void)
+{
+	printf("Running test_aec_delay_paths...\n");
+	const int delays[3] = {20, 60, 100};
+	for (int i = 0; i < 3; i++)
+		ASSERT_TRUE(aec_erle(16000, delays[i]) > 15.0, "AEC cancels a broadband echo (ERLE > 15 dB) at 16 kHz");
+	ASSERT_TRUE(aec_erle(8000, 100) > 15.0, "AEC cancels a broadband echo (ERLE > 15 dB) at 8 kHz");
+
+	/* far end silent: the near end passes unchanged (apart from the added latency) */
+	const int rate = 16000, n = rate * 3;
+	int16_t *near = malloc(n * sizeof(int16_t));
+	int16_t *far = calloc(n, sizeof(int16_t));
+	aec_far_signal(near, n, rate, 3);
+	int16_t *ref = malloc(n * sizeof(int16_t));
+	memcpy(ref, near, n * sizeof(int16_t));
+	struct aec_handle *h = (struct aec_handle *)audio_process_aec_create(rate, NULL);
+	for (int f = 0; f + 2 <= n / 160; f += 2) {
+		struct aec_frame frm = { .far = far + f * 160, .near = near + f * 160, .num_bytes = 640 };
+		audio_process_aec_process(h, &frm);
+	}
+	audio_process_aec_free(h);
+	double in_rms = compute_rms_i16(ref, rate, n - 2000), out_rms = compute_rms_i16(near, rate + 400, n);
+	ASSERT_TRUE(fabs(20.0 * log10(out_rms / in_rms)) < 1.0, "AEC leaves the near end alone when the far end is silent");
+	free(near); free(far); free(ref);
 	printf("  -> PASS\n");
 }
 
@@ -549,16 +1235,27 @@ int main(void)
 	test_howling_guardrails();
 	record_quality_gate("HS", "Feedback Notch Suppression", "> 3.0 dB", "5.4 dB", "PASS");
 
+	test_howling_low_address();
+	test_howling_call_shapes();
+	record_quality_gate("HS", "Any call length and both call shapes", "Bit-exact across cuts", "Bit-exact", "PASS");
+
 	test_extreme_audio_stress();
 	record_quality_gate("STRESS", "Full-scale Nyquist / Spikes", "Zero overflows", "Bit-bounded", "PASS");
 
 	test_agc_guardrails();
 	record_quality_gate("AGC", "Target Level & Limiter Headroom", "No clipping", "Exact level locked", "PASS");
 
+	test_agc_regressions();
+	record_quality_gate("AGC", "Peak lock within 0.5 dB, no rail samples, call-size independent", "Per section 4.2 and 4.8", "Met", "PASS");
+
 	test_ns_guardrails();
 	record_quality_gate("NS", "Stationary Noise Attenuation", "> 5.0 dB", "6.8--18.8 dB", "PASS");
 
+	test_ns_regressions();
+	record_quality_gate("NS", "Speech Transparency & Robustness", "< 3 dB speech loss", "Within gates", "PASS");
+
 	test_aec_guardrails();
+	test_aec_delay_paths();
 	record_quality_gate("AEC", "Echo Return Loss (ERLE)", "> 6.0 dB", "> 130 dB", "PASS");
 
 	test_fft_guardrails();

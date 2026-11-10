@@ -65,6 +65,11 @@ jobs:
           make CROSS_COMPILE=mipsel-linux-gnu- size
           cp libaudioProcess.so ../libaudioProcess_candidate_mips.so
 
+      - name: Check libimp ABI symbols (candidate)
+        run: |
+          cd candidate
+          sh scripts/check_abi.sh ../libaudioProcess_candidate_mips.so mipsel-linux-gnu-nm
+
       - name: Run MIPS Baseline vs Candidate Throughput Benchmark (QEMU)
         run: |
           cd candidate

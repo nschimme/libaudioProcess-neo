@@ -6,7 +6,7 @@
 
 #include "audio_process.h"
 #include "biquad.h"
-#include "webrtc/common_audio/fft4g.h"
+#include "fft.h"
 
 #define HD_FFT_SIZE    128
 #define HD_HALF_FFT    64
@@ -39,6 +39,10 @@ struct hd_state {
 	struct biquad notches[HD_MAX_NOTCHES];
 	int notch_bins[HD_MAX_NOTCHES];
 	int num_notches;
+
+	/* streaming: input of the block being collected, and its fill level */
+	int16_t raw[HD_FFT_SIZE];
+	int pos;
 
 	/* FFT workspace (auto-initialized when ip[0]==0) */
 	float fft_buf[HD_FFT_SIZE];
@@ -187,37 +191,78 @@ void *audio_process_hs_create(int sample_rate, int frame_size)
 	return s;
 }
 
-void audio_process_hs_process(void *handle, int16_t *data, int num_samples)
+/*
+ * Apply the active notches to n samples that sit at positions pos..pos+n-1 of
+ * the current analysis block. The first HD_CROSSFADE positions of a block fade
+ * the filtered signal in, as before; the rest use the block filter.
+ */
+static void hd_filter(struct hd_state *s, int16_t *buf, int pos, int n)
+{
+	const float inv_crossfade = 1.0f / (float)HD_CROSSFADE;
+
+	for (int i = 0; i < s->num_notches; i++) {
+		struct biquad *notch = &s->notches[i];
+		int j = 0;
+
+		for (; j < n && pos + j < HD_CROSSFADE; j++) {
+			int16_t filtered = biquad_process_i16(notch, buf[j]);
+			float t = (float)(pos + j) * inv_crossfade;
+			buf[j] = (int16_t)((1.0f - t) * (float)buf[j] + t * (float)filtered);
+		}
+		if (j < n)
+			biquad_process_block_i16(notch, buf + j, buf + j, n - j);
+	}
+}
+
+/*
+ * Two call shapes are accepted (see docs, section 4.6):
+ *  - vendor libimp: hs_process(handle, buf, buf, num_bytes): the same pointer
+ *    twice (in place) and a byte count;
+ *  - this library's and openimp's original shape: hs_process(handle, data,
+ *    num_samples), where the third argument is a sample count of any size.
+ * The vendor call is recognised by pointer equality, which holds wherever the
+ * buffer lives (on MIPS32 a heap buffer can sit below 16 MB, and a count can
+ * be large, so no size threshold can tell the shapes apart). Every other call
+ * is the sample-count shape.
+ *
+ * Any length is processed: samples are filtered as they arrive, the
+ * 128-sample analysis block fills across calls, and the notches found from a
+ * completed block apply from the next sample on.
+ */
+void audio_process_hs_process(void *handle, int16_t *data, uintptr_t arg2,
+			      uintptr_t arg3)
 {
 	struct hd_state *s = handle;
-	if (!s || !data || num_samples <= 0)
+	if (!s || !data)
 		return;
 
-	int num_frames = num_samples / HD_FFT_SIZE;
+	int n;
+	if (arg2 == (uintptr_t)data)
+		n = (int)(arg3 / sizeof(int16_t));
+	else
+		n = (int)arg2;
+	if (n <= 0)
+		return;
 
-	for (int f = 0; f < num_frames; f++) {
-		int16_t *frame = data + f * HD_FFT_SIZE;
+	while (n > 0) {
+		int take = HD_FFT_SIZE - s->pos;
+		if (take > n)
+			take = n;
 
-		hd_compute_spectrum(s, frame);
+		memcpy(s->raw + s->pos, data, (size_t)take * sizeof(int16_t));
+		hd_filter(s, data, s->pos, take);
+		s->pos += take;
+		data += take;
+		n -= take;
 
-		int candidates[HD_HALF_FFT];
-		int num_cand = hd_detect_candidates(s, candidates);
+		if (s->pos == HD_FFT_SIZE) {
+			int candidates[HD_HALF_FFT];
 
-		hd_update_persistence(s, candidates, num_cand);
-		hd_update_notches(s);
-
-		const float inv_crossfade = 1.0f / (float)HD_CROSSFADE;
-		for (int i = 0; i < s->num_notches; i++) {
-			struct biquad *notch = &s->notches[i];
-			/* Crossfade portion: first HD_CROSSFADE samples */
-			for (int j = 0; j < HD_CROSSFADE; j++) {
-				int16_t filtered = biquad_process_i16(notch, frame[j]);
-				float t = (float)j * inv_crossfade;
-				frame[j] = (int16_t)((1.0f - t) * (float)frame[j] + t * (float)filtered);
-			}
-			/* Remaining steady-state samples: use block processing directly */
-			biquad_process_block_i16(notch, frame + HD_CROSSFADE, frame + HD_CROSSFADE,
-						 HD_FFT_SIZE - HD_CROSSFADE);
+			hd_compute_spectrum(s, s->raw);
+			int num_cand = hd_detect_candidates(s, candidates);
+			hd_update_persistence(s, candidates, num_cand);
+			hd_update_notches(s);
+			s->pos = 0;
 		}
 	}
 }

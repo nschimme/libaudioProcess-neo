@@ -30,9 +30,42 @@
 #define AEC_MAX_BLOCK_LEN   128
 #define AEC_MAX_FFT_LEN     256
 #define AEC_MAX_BINS        (AEC_MAX_FFT_LEN / 2 + 1)  /* 129 bins */
-#define AEC_NUM_PARTITIONS  16
+#define AEC_NUM_PARTITIONS  32
 #define AEC_MAX_DELAY_SAMP  4800                       /* Up to 100ms at 48kHz */
 #define AEC_FIFO_SIZE       4096                       /* Ample headroom for framing */
+#ifndef AEC_TRACK_PEAKY
+#define AEC_TRACK_PEAKY     0.85f /* a bin holding more of the far-end power than this is a tone (speech: median 0.3, p99 0.75) */
+#endif
+#ifndef AEC_TRACK_VERIFY
+#define AEC_TRACK_VERIFY    120   /* adapting blocks after a shift before it is judged */
+#endif
+#ifndef AEC_TRACK_LOWRUN
+#define AEC_TRACK_LOWRUN    200   /* adapting blocks of poor cancellation before a tracked delay is dropped */
+#endif
+#ifndef AEC_TRACK_HOLDOFF
+#define AEC_TRACK_HOLDOFF   400   /* adapting blocks without tracking after a failed shift or a drop */
+#endif
+#ifndef AEC_TRACK_BLOCKS
+#define AEC_TRACK_BLOCKS    8     /* adapting blocks between delay checks */
+#endif
+#ifndef AEC_TRACK_LATE
+#define AEC_TRACK_LATE      8     /* echo peak at or beyond this partition counts as late */
+#endif
+#ifndef AEC_TRACK_CONFIRM
+#define AEC_TRACK_CONFIRM   10    /* consecutive late checks before the delay moves */
+#endif
+#ifndef AEC_TRACK_KEEP
+#define AEC_TRACK_KEEP      3     /* partitions of lead kept in front of the echo peak */
+#endif
+#ifndef AEC_MU0
+#define AEC_MU0             0.4f
+#endif
+#ifndef AEC_MU_MIN
+#define AEC_MU_MIN          0.3f
+#endif
+#ifndef AEC_MU_DECAY
+#define AEC_MU_DECAY        0.9995f
+#endif
 
 struct aec_state {
 	int block_len;            /* L: frame partition length (e.g. 64 or 128) */
@@ -64,6 +97,17 @@ struct aec_state {
 	float X_re[AEC_NUM_PARTITIONS][AEC_MAX_BINS];
 	float X_im[AEC_NUM_PARTITIONS][AEC_MAX_BINS];
 	int x_pos;
+	int delay_base;      /* configured delay, the floor for the tracked one */
+	int last_shift;      /* samples added by the last shift */
+	int since_shift;     /* adapting blocks since that shift, 0 when none is pending */
+	int low_count;       /* adapting blocks in a row with poor linear cancellation */
+	int holdoff;         /* adapting blocks left without tracking */
+	float acc_near;      /* smoothed near-end energy while adapting */
+	float acc_res;       /* smoothed linear residual energy while adapting */
+	float best_ratio;    /* best smoothed near/residual energy ratio, slowly decaying */
+	int track_count;     /* adaptation blocks since the last delay check */
+	int track_late;      /* consecutive checks with the echo peak in a late partition */
+	int constrain_pos;   /* next partition whose gradient is constrained (round robin) */
 
 	/* Split-complex adaptive filter weights: W_re[p][k], W_im[p][k] */
 	float W_re[AEC_NUM_PARTITIONS][AEC_MAX_BINS];
@@ -98,39 +142,6 @@ struct aec_state {
 	float near_gain;
 };
 
-/* Unpack Ooura RDFT into standard split-complex format */
-static inline void unpack_ooura_to_split(const float *__restrict__ a,
-					float *__restrict__ re,
-					float *__restrict__ im,
-					int n)
-{
-	int half_n = n >> 1;
-	re[0] = a[0];
-	im[0] = 0.0f;
-	re[half_n] = a[1];
-	im[half_n] = 0.0f;
-
-	for (int k = 1; k < half_n; k++) {
-		re[k] = a[2 * k];
-		im[k] = -a[2 * k + 1];
-	}
-}
-
-/* Pack standard split-complex format back into Ooura RDFT for IFFT */
-static inline void pack_split_to_ooura(const float *__restrict__ re,
-				      const float *__restrict__ im,
-				      float *__restrict__ a,
-				      int n)
-{
-	int half_n = n >> 1;
-	a[0] = re[0];
-	a[1] = re[half_n];
-
-	for (int k = 1; k < half_n; k++) {
-		a[2 * k] = re[k];
-		a[2 * k + 1] = -im[k];
-	}
-}
 
 /* Purely linear, contiguous SIMD split-complex MAC */
 static inline void split_complex_mul_add(float *__restrict__ y_re,
@@ -179,16 +190,14 @@ static void pbfdaf_process_block(struct aec_state *st,
 	const int K = st->num_bins;
 	const int P = st->num_partitions;
 
-	/* 1. Build extended far-end frame [x_old, x_new] and compute RDFT */
+	/* 1. Build extended far-end frame [x_old, x_new] and compute direct split RDFT */
 	float x_time[AEC_MAX_FFT_LEN];
 	memcpy(x_time, st->x_old, L * sizeof(float));
 	memcpy(x_time + L, far_block, L * sizeof(float));
 	memcpy(st->x_old, far_block, L * sizeof(float));
 
-	audio_process_rdft(N, 1, x_time);
-
 	st->x_pos = (st->x_pos - 1 + P) % P;
-	unpack_ooura_to_split(x_time, st->X_re[st->x_pos], st->X_im[st->x_pos], N);
+	audio_process_rdft_forward(N, x_time, st->X_re[st->x_pos], st->X_im[st->x_pos]);
 
 	/* 2. Frequency-domain convolution across all partitions: Y(k) = sum_p W_p(k) * X_{x_pos + p}(k) */
 	float Y_re[AEC_MAX_BINS] = {0};
@@ -201,10 +210,9 @@ static void pbfdaf_process_block(struct aec_state *st,
 				      st->W_re[p], st->W_im[p], K);
 	}
 
-	/* 3. Inverse transform of estimated echo Y */
+	/* 3. Inverse transform of estimated echo Y directly to time domain */
 	float y_time[AEC_MAX_FFT_LEN];
-	pack_split_to_ooura(Y_re, Y_im, y_time, N);
-	audio_process_rdft(N, -1, y_time);
+	audio_process_rdft_inverse(N, Y_re, Y_im, y_time);
 
 	const float ifft_scale = 2.0f / (float)N;
 	#pragma GCC ivdep
@@ -217,6 +225,7 @@ static void pbfdaf_process_block(struct aec_state *st,
 	float near_energy = 0.0f;
 	float echo_energy = 0.0f;
 	float far_energy = 0.0f;
+	float res_energy = 0.0f;
 
 	#pragma GCC ivdep
 	for (int i = 0; i < L; i++) {
@@ -224,6 +233,7 @@ static void pbfdaf_process_block(struct aec_state *st,
 		float y_val = y_time[L + i];
 		float e_val = d_val - y_val;
 		e_linear[i] = e_val;
+		res_energy += e_val * e_val;
 
 		near_energy += d_val * d_val;
 		echo_energy += y_val * y_val;
@@ -265,13 +275,12 @@ static void pbfdaf_process_block(struct aec_state *st,
 		step_bins[k] = (s > 0.4f) ? 0.4f : s;
 	}
 
-	/* 6. Filter adaptation in frequency domain */
+	/* 6. Filter adaptation in frequency domain with direct split RDFT */
 	float e_time[AEC_MAX_FFT_LEN] = {0};
 	memcpy(e_time + L, e_linear, L * sizeof(float));
-	audio_process_rdft(N, 1, e_time);
 
 	float E_re[AEC_MAX_BINS], E_im[AEC_MAX_BINS];
-	unpack_ooura_to_split(e_time, E_re, E_im, N);
+	audio_process_rdft_forward(N, e_time, E_re, E_im);
 
 	if (!double_talk && far_energy > st->far_pow_thd) {
 		for (int p = 0; p < P; p++) {
@@ -280,19 +289,125 @@ static void pbfdaf_process_block(struct aec_state *st,
 						      E_re, E_im,
 						      st->X_re[idx], st->X_im[idx],
 						      step_bins, K);
+		}
 
-			/* Constrained gradient: IFFT -> zero uncausal half -> forward FFT */
+		/* Constrain ONE partition per block, round robin (zero the
+		 * uncausal half of its impulse response). All partitions get the
+		 * constraint every P blocks; it costs two transforms per block
+		 * instead of 2P. */
+		{
+			int p = st->constrain_pos;
+			st->constrain_pos = (p + 1) % P;
 			float w_time[AEC_MAX_FFT_LEN];
-			pack_split_to_ooura(st->W_re[p], st->W_im[p], w_time, N);
-			audio_process_rdft(N, -1, w_time);
+			audio_process_rdft_inverse(N, st->W_re[p], st->W_im[p], w_time);
 
 			#pragma GCC ivdep
 			for (int i = 0; i < L; i++) {
 				w_time[i] *= ifft_scale;
 			}
 			memset(w_time + L, 0, L * sizeof(float));
-			audio_process_rdft(N, 1, w_time);
-			unpack_ooura_to_split(w_time, st->W_re[p], st->W_im[p], N);
+			audio_process_rdft_forward(N, w_time, st->W_re[p], st->W_im[p]);
+		}
+
+		/* Delay tracking: if the echo peak of the adaptive filter sits in a
+		 * late partition for a while, delay the far-end reference by that
+		 * amount and shift the weights down, so the filter span is spent on
+		 * the echo instead of on the dead time before it. */
+		/* How well does the linear filter cancel while it adapts? */
+		st->acc_near = 0.98f * st->acc_near + near_energy;
+		st->acc_res = 0.98f * st->acc_res + res_energy;
+		const int cancelling = st->acc_res < 0.5f * st->acc_near;   /* at least 3 dB */
+		/* cancellation relative to the best this filter recently achieved: a
+		 * sudden 10 dB loss means the echo path changed under it */
+		const float ratio = st->acc_near / (st->acc_res + 1.0f);
+		st->best_ratio = ratio > st->best_ratio ? ratio : st->best_ratio * 0.9995f;
+		const int collapsed = ratio < 0.1f * st->best_ratio && st->best_ratio > 10.0f;
+
+		if (st->holdoff > 0)
+			st->holdoff--;
+
+		/* a shift that did not help is undone */
+		if (st->since_shift > 0 && ++st->since_shift >= AEC_TRACK_VERIFY) {
+			st->since_shift = 0;
+			if (!cancelling && st->delay_samples >= st->delay_base + st->last_shift) {
+				st->delay_samples -= st->last_shift;
+				memset(st->W_re, 0, sizeof(st->W_re));
+				memset(st->W_im, 0, sizeof(st->W_im));
+				memset(st->X_re, 0, sizeof(st->X_re));
+				memset(st->X_im, 0, sizeof(st->X_im));
+				memset(st->x_old, 0, sizeof(st->x_old));
+				st->holdoff = AEC_TRACK_HOLDOFF;
+			}
+		}
+
+		/* a tracked delay that cancels poorly for long (the path may have
+		 * got shorter, so the echo now precedes the delayed reference) is dropped */
+		if (st->delay_samples > st->delay_base) {
+			if (!collapsed) {
+				st->low_count = 0;
+			} else if (++st->low_count >= AEC_TRACK_LOWRUN) {
+				st->low_count = 0;
+				st->best_ratio = 0.0f;
+				st->delay_samples = st->delay_base;
+				memset(st->W_re, 0, sizeof(st->W_re));
+				memset(st->W_im, 0, sizeof(st->W_im));
+				memset(st->X_re, 0, sizeof(st->X_re));
+				memset(st->X_im, 0, sizeof(st->X_im));
+				memset(st->x_old, 0, sizeof(st->x_old));
+				st->holdoff = 0;
+			}
+		}
+
+		if (++st->track_count >= AEC_TRACK_BLOCKS) {
+			st->track_count = 0;
+
+			/* A narrowband reference (a tone, a hum) has no unique delay:
+			 * every multiple of its period fits. Only track a broadband one. */
+			float pw_sum = 0.0f, pw_max = 0.0f;
+			for (int k = 0; k < K; k++) {
+				pw_sum += st->power_X[k];
+				if (st->power_X[k] > pw_max)
+					pw_max = st->power_X[k];
+			}
+			int broadband = pw_max < AEC_TRACK_PEAKY * pw_sum;
+
+			float best = 0.0f, total = 0.0f;
+			int pk = 0;
+			for (int p = 0; p < P; p++) {
+				float e = 0.0f;
+				for (int k = 0; k < K; k++)
+					e += st->W_re[p][k] * st->W_re[p][k] + st->W_im[p][k] * st->W_im[p][k];
+				total += e;
+				if (e > best) { best = e; pk = p; }
+			}
+			if (broadband && st->holdoff == 0 && st->since_shift == 0 && total > 0.0f && best > 0.3f * total && pk >= AEC_TRACK_LATE) {
+				if (++st->track_late >= AEC_TRACK_CONFIRM) {
+					int shift = pk - AEC_TRACK_KEEP;
+					int room = (AEC_MAX_DELAY_SAMP - 1 - st->delay_samples) / L;
+					if (shift > room)
+						shift = room;
+					if (shift > 0) {
+						st->delay_samples += shift * L;
+						st->last_shift = shift * L;
+						st->since_shift = 1;
+						st->low_count = 0;
+						for (int p = 0; p + shift < P; p++) {
+							memcpy(st->W_re[p], st->W_re[p + shift], sizeof(st->W_re[p]));
+							memcpy(st->W_im[p], st->W_im[p + shift], sizeof(st->W_im[p]));
+						}
+						for (int p = P - shift; p < P; p++) {
+							memset(st->W_re[p], 0, sizeof(st->W_re[p]));
+							memset(st->W_im[p], 0, sizeof(st->W_im[p]));
+						}
+						memset(st->X_re, 0, sizeof(st->X_re));
+						memset(st->X_im, 0, sizeof(st->X_im));
+						memset(st->x_old, 0, sizeof(st->x_old));
+					}
+					st->track_late = 0;
+				}
+			} else {
+				st->track_late = 0;
+			}
 		}
 
 		if (st->mu > st->mu_min) {
@@ -338,8 +453,7 @@ static void pbfdaf_process_block(struct aec_state *st,
 			E_im[k] *= g_bin;
 		}
 
-		pack_split_to_ooura(E_re, E_im, e_time, N);
-		audio_process_rdft(N, -1, e_time);
+		audio_process_rdft_inverse(N, E_re, E_im, e_time);
 
 		#pragma GCC ivdep
 		for (int i = 0; i < L; i++) {
@@ -393,10 +507,11 @@ void *audio_process_aec_create(int sample_rate, const char *profile_path)
 		if (st->delay_samples >= AEC_MAX_DELAY_SAMP)
 			st->delay_samples = AEC_MAX_DELAY_SAMP - 1;
 	}
+	st->delay_base = st->delay_samples;
 
-	st->mu = (cfg.user_mode && cfg.mu_min > 0.0f) ? 0.35f : 0.25f;
-	st->mu_min = (cfg.user_mode && cfg.mu_min > 0.0f) ? cfg.mu_min : 0.05f;
-	st->mu_decay = (cfg.user_mode && cfg.mu_decay > 0.0f) ? cfg.mu_decay : 0.998f;
+	st->mu = (cfg.user_mode && cfg.mu_min > 0.0f) ? 0.35f : AEC_MU0;
+	st->mu_min = (cfg.user_mode && cfg.mu_min > 0.0f) ? cfg.mu_min : AEC_MU_MIN;
+	st->mu_decay = (cfg.user_mode && cfg.mu_decay > 0.0f) ? cfg.mu_decay : AEC_MU_DECAY;
 	st->far_pow_thd = (cfg.user_mode && cfg.far_pow_thd > 0.0f) ? cfg.far_pow_thd : 50.0f;
 	st->safe_suppression = (cfg.user_mode && cfg.safe_suppression > 0.0f) ? cfg.safe_suppression : 1.0f;
 	st->chassis_margin_db = 4.5f;
@@ -411,7 +526,7 @@ void *audio_process_aec_create(int sample_rate, const char *profile_path)
 		st->restrain_factor = (cfg.restrain_factor > 0.9f) ? 0.9f : cfg.restrain_factor;
 	}
 
-	audio_process_rdft(st->fft_len, 1, NULL);
+	aec_rdft_init();
 
 	h->aec = st;
 	return h;
@@ -437,21 +552,15 @@ int audio_process_aec_process(struct aec_handle *h, struct aec_frame *f)
 	int16_t *near_ptr = f->near;
 
 	for (int frm = 0; frm < num_frames; frm++) {
-		/* Apply far-end delay compensation in a circular ring buffer */
-		if (st->delay_samples > 0) {
-			for (int i = 0; i < samples_10ms; i++) {
-				float delayed_val = st->far_delay_buf[st->delay_idx];
-				st->far_delay_buf[st->delay_idx] = (float)far_ptr[i] * far_gain;
-				st->delay_idx++;
-				if (st->delay_idx >= st->delay_samples)
-					st->delay_idx = 0;
-
-				st->far_fifo[st->far_avail++] = delayed_val;
-			}
-		} else {
-			for (int i = 0; i < samples_10ms; i++) {
-				st->far_fifo[st->far_avail++] = (float)far_ptr[i] * far_gain;
-			}
+		/* Far-end delay compensation (configured plus tracked) in a ring buffer */
+		for (int i = 0; i < samples_10ms; i++) {
+			st->far_delay_buf[st->delay_idx] = (float)far_ptr[i] * far_gain;
+			int rd = st->delay_idx - st->delay_samples;
+			if (rd < 0)
+				rd += AEC_MAX_DELAY_SAMP;
+			st->far_fifo[st->far_avail++] = st->far_delay_buf[rd];
+			if (++st->delay_idx >= AEC_MAX_DELAY_SAMP)
+				st->delay_idx = 0;
 		}
 
 		for (int i = 0; i < samples_10ms; i++) {

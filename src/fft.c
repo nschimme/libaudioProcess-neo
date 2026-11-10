@@ -14,10 +14,10 @@
  * Implements high-throughput, cache-efficient, in-place real transforms
  * using pre-computed twiddle tables and branchless bit-reversal permutations.
  *
- * Supported sizes: 128, 256, 512.
+ * Supported sizes: 128, 256, 512, 1024.
  */
 
-#define MAX_FFT_N 512
+#define MAX_FFT_N 1024
 #define MAX_FFT_M (MAX_FFT_N / 2)
 
 static uint8_t pair_64_i[32], pair_64_j[32];
@@ -29,9 +29,12 @@ static int n_pairs_128 = 0;
 static uint16_t pair_256_i[128], pair_256_j[128];
 static int n_pairs_256 = 0;
 
-static float tw_stage_fwd_re[256];
-static float tw_stage_fwd_im[256];
-static float tw_stage_inv_im[256];
+static uint16_t pair_512_i[256], pair_512_j[256];
+static int n_pairs_512 = 0;
+
+static float tw_stage_fwd_re[512];
+static float tw_stage_fwd_im[512];
+static float tw_stage_inv_im[512];
 
 static float tw_r_re[MAX_FFT_N / 4 + 1];
 static float tw_r_im[MAX_FFT_N / 4 + 1];
@@ -85,8 +88,22 @@ static void init_tables(void)
 		}
 	}
 
+	n_pairs_512 = 0;
+	for (uint32_t i = 0; i < 512; i++) {
+		uint32_t r = 0;
+		for (int b = 0; b < 9; b++) {
+			if (i & (1 << b))
+				r |= (1 << (8 - b));
+		}
+		if (i < r) {
+			pair_512_i[n_pairs_512] = (uint16_t)i;
+			pair_512_j[n_pairs_512] = (uint16_t)r;
+			n_pairs_512++;
+		}
+	}
+
 	int off = 0;
-	for (int len = 4; len <= 256; len <<= 1) {
+	for (int len = 4; len <= 512; len <<= 1) {
 		int half = len >> 1;
 		for (int j = 0; j < half; j++) {
 			double angle = -2.0 * M_PI * (double)j / (double)len;
@@ -98,9 +115,9 @@ static void init_tables(void)
 	}
 
 	for (size_t k = 0; k <= MAX_FFT_N / 4; k++) {
-		double angle = 2.0 * M_PI * (double)k / (double)MAX_FFT_N;
+		double angle = -2.0 * M_PI * (double)k / (double)MAX_FFT_N;
 		tw_r_re[k] = (float)cos(angle);
-		tw_r_im[k] = (float)(-sin(angle));
+		tw_r_im[k] = (float)sin(angle);
 	}
 
 	tables_initialized = 1;
@@ -132,6 +149,16 @@ static inline void bit_reverse_permute(float *__restrict__ a, size_t m)
 		for (int p = 0; p < n_pairs_256; p++) {
 			size_t i = pair_256_i[p];
 			size_t j = pair_256_j[p];
+			float tr0 = a[2 * i], ti0 = a[2 * i + 1];
+			a[2 * i] = a[2 * j];
+			a[2 * i + 1] = a[2 * j + 1];
+			a[2 * j] = tr0;
+			a[2 * j + 1] = ti0;
+		}
+	} else if (m == 512) {
+		for (int p = 0; p < n_pairs_512; p++) {
+			size_t i = pair_512_i[p];
+			size_t j = pair_512_j[p];
 			float tr0 = a[2 * i], ti0 = a[2 * i + 1];
 			a[2 * i] = a[2 * j];
 			a[2 * i + 1] = a[2 * j + 1];
@@ -239,9 +266,19 @@ static void complex_fft(float *__restrict__ a, size_t m, int isgn)
 	}
 }
 
+/* The tables are built once when the library is loaded (dlopen runs this single
+ * threaded), not lazily on the first transform. The NS runs on libimp's capture
+ * thread and the software AEC on raptor's, and both use this FFT: a lazy build
+ * guarded by a plain flag could be entered by two threads at once, and on a
+ * weakly ordered CPU (MIPS) the flag can become visible before the table data. */
+__attribute__((constructor)) static void audio_process_fft_load(void)
+{
+	init_tables();
+}
+
 void audio_process_rdft(size_t n, int isgn, float *a)
 {
-	if (!a || (n != 128 && n != 256 && n != 512))
+	if (!a || (n != 128 && n != 256 && n != 512 && n != 1024))
 		return;
 
 	if (!tables_initialized)
@@ -332,6 +369,42 @@ void audio_process_rdft(size_t n, int isgn, float *a)
 
 		complex_fft(a, m, -1);
 	}
+}
+
+void audio_process_rdft_forward(size_t n, const float *__restrict__ in_time,
+				float *__restrict__ out_re, float *__restrict__ out_im)
+{
+	float a[MAX_FFT_N];
+	memcpy(a, in_time, n * sizeof(float));
+	audio_process_rdft(n, 1, a);
+
+	size_t half_n = n >> 1;
+	out_re[0] = a[0];
+	out_im[0] = 0.0f;
+	out_re[half_n] = a[1];
+	out_im[half_n] = 0.0f;
+
+	for (size_t k = 1; k < half_n; k++) {
+		out_re[k] = a[2 * k];
+		out_im[k] = -a[2 * k + 1];
+	}
+}
+
+void audio_process_rdft_inverse(size_t n, const float *__restrict__ in_re,
+				const float *__restrict__ in_im, float *__restrict__ out_time)
+{
+	float a[MAX_FFT_N];
+	size_t half_n = n >> 1;
+	a[0] = in_re[0];
+	a[1] = in_re[half_n];
+
+	for (size_t k = 1; k < half_n; k++) {
+		a[2 * k] = in_re[k];
+		a[2 * k + 1] = -in_im[k];
+	}
+
+	audio_process_rdft(n, -1, a);
+	memcpy(out_time, a, n * sizeof(float));
 }
 
 /* Drop-in replacements for WebRTC legacy symbols */

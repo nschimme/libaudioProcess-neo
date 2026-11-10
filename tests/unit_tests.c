@@ -568,6 +568,24 @@ static void test_agc_regressions(void)
 	double sp_out = compute_rms_i16(x, 16000, 2 * 16000);
 	ASSERT_TRUE(rout / rin <= (sp_out / sp_in) * 1.05, "AGC does not raise the noise bed above the speech gain");
 
+	/* 5. stationary noise alone (most of a camera's life) is never boosted,
+	 * even with a large gain cap */
+	{
+		const int m = 16000 * 10;
+		int16_t *nz = malloc(m * sizeof(int16_t));
+		int16_t *nr = malloc(m * sizeof(int16_t));
+		unsigned s5 = 3;
+		for (int i = 0; i < m; i++) {
+			s5 = s5 * 1103515245u + 12345u;
+			nz[i] = (int16_t)(((int)((s5 >> 16) & 0x7fff) - 16384) * 0.0049); /* about -60 dBFS rms */
+		}
+		memcpy(nr, nz, m * sizeof(int16_t));
+		agc_run(nz, m, 160, 3, 12, 1);
+		ASSERT_TRUE(compute_rms_i16(nz, m - 48000, m) <= compute_rms_i16(nr, m - 48000, m) * 1.0,
+			    "AGC does not boost stationary noise");
+		free(nz); free(nr);
+	}
+
 	free(x); free(ref);
 	printf("  -> PASS\n");
 }

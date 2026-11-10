@@ -32,6 +32,9 @@
 #define AGC_FLOOR       32.0f  /* envelope (peak counts) below which gain holds */
 #define AGC_REF_DECAY   0.99967f /* per ms: speech reference falls over about 3 s */
 #define AGC_PAUSE_RATIO 0.22f  /* envelope below this share of the reference = pause */
+#define AGC_FLOOR_RISE  1.0003f /* per ms: the noise-floor estimate may rise 2.6 dB per second */
+#define AGC_SPEECH_RATIO 5.0f  /* speech reference at least this many times the floor = speech present */
+#define AGC_GAIN_IDLE   0.002f /* share of the way back to unity per ms without speech */
 #define AGC_PAUSE_ATTEN 0.77f  /* gain factor reached in a long pause (-2.3 dB) */
 #define AGC_PAUSE_IN    0.010f /* share of the way to the pause factor per ms */
 #define AGC_PAUSE_OUT   0.02f  /* share of the way back to unity per ms */
@@ -58,6 +61,7 @@ struct modern_agc {
 	float gain_step;     /* per-sample ramp towards the current goal */
 	float gain_goal;     /* gain at the end of the current millisecond */
 	float speech_ref;    /* slow peak of the envelope: what speech looks like */
+	float floor_est;     /* envelope minimum: the noise floor */
 	float pause;         /* extra gain factor in pauses, 1 in speech */
 	float pause_applied; /* the pause factor in force at the start of this ms */
 	int sub_pos;
@@ -78,6 +82,7 @@ static void agc_prepare(struct modern_agc *st)
 	st->gain_goal = 1.0f;
 	st->gain_step = 0.0f;
 	st->speech_ref = 0.0f;
+	st->floor_est = 0.0f;
 	st->pause = 1.0f;
 	st->pause_applied = 1.0f;
 	st->sub_pos = 0;
@@ -202,7 +207,13 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 				st->speech_ref *= AGC_REF_DECAY;
 				if (st->env > st->speech_ref)
 					st->speech_ref = st->env;
-				int pause = st->env < AGC_PAUSE_RATIO * st->speech_ref;
+				st->floor_est = st->floor_est * AGC_FLOOR_RISE + 0.01f;
+				if (st->env < st->floor_est)
+					st->floor_est = st->env;
+
+				/* speech has a wide envelope range; steady noise does not */
+				int speech = st->speech_ref > AGC_SPEECH_RATIO * st->floor_est;
+				int pause = !speech || st->env < AGC_PAUSE_RATIO * st->speech_ref;
 
 				float cur = st->gain_goal;
 				float desired = cur;
@@ -214,7 +225,12 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 					if (pause && desired > cur)
 						desired = cur;
 				}
+				/* without speech nothing is boosted: drift back to unity */
+				if (!speech && desired > 1.0f)
+					desired = 1.0f;
 				float coef = desired < cur ? AGC_GAIN_DOWN : AGC_GAIN_UP;
+				if (!speech && desired < cur && st->env <= st->target_peak / cur)
+					coef = AGC_GAIN_IDLE; /* easing back to unity must not step */
 				float goal = cur + (desired - cur) * coef;
 
 				/* slow extra attenuation in pauses, quick recovery in speech */

@@ -483,19 +483,21 @@ static void test_ns_guardrails(void)
 			}
 		}
 
-		/* High bands must be a delayed, scaled copy: a unit impulse in a high band
-		 * comes out one frame (frame_len samples) later, not on the same frame. */
+		/* High bands must be a delayed, scaled copy of the input, delayed by the same
+		 * ov = 3/5 of a block (96 samples at 16 kHz) as the low band: an impulse at
+		 * index 5 of a block comes out at index 5 + ov, not at index 5. */
 		if (num_bands > 1) {
+			int ov = (frame_len * 3) / 5;
 			fn_ns_set_config(ns, rate, 0);
 			for (int f = 0; f < 80; f++) {
 				for (int b = 0; b < num_bands; b++)
 					for (int i = 0; i < frame_len; i++)
 						in_f[b][i] = (b == 1 && f == 40 && i == 5) ? 0.5f : 0.0f;
 				fn_ns_process(ns, inp, num_bands, outp);
-				if (f == 40)
-					ASSERT_TRUE(fabsf(out_f[1][5]) < 1e-6f, "High band is delayed by one frame");
-				if (f == 41)
-					ASSERT_TRUE(fabsf(out_f[1][5]) > 0.05f, "High band impulse arrives one frame later");
+				if (f == 40) {
+					ASSERT_TRUE(fabsf(out_f[1][5]) < 1e-6f, "High band is not passed through undelayed");
+					ASSERT_TRUE(fabsf(out_f[1][5 + ov]) > 0.05f, "High band impulse arrives ov samples later");
+				}
 			}
 		}
 		for (int b = 0; b < num_bands; b++) {

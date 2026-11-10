@@ -23,10 +23,10 @@
  * - 100% ABI and configuration compatibility with audio_process_ns_* and WebRtcNs_*.
  */
 
-#define NS_MAX_FRAME_SIZE 480
+#define NS_MAX_FRAME_SIZE 160   /* largest block length (samples per call) */
 #define NS_BAND_LEN       160   /* samples per band for every rate except 8 kHz (WebRTC contract) */
 #define NS_MAX_HIGH_BANDS 2     /* 48 kHz: 3 bands = 1 low + 2 high */
-#define NS_MAX_FFT_LEN    1024
+#define NS_MAX_FFT_LEN    256    /* window length = FFT length: 128 (8 kHz) or 256 */
 #define NS_MAX_BINS       (NS_MAX_FFT_LEN / 2 + 1)
 #define NS_SUB_WIN_LEN    60
 #define NS_NOISE_FLOOR    1e-9f   /* absolute floor on the noise power estimate */
@@ -39,8 +39,9 @@
 struct modern_ns_state {
 	int sample_rate;
 	int policy;
-	int frame_size;
-	int fft_len;
+	int frame_size;     /* L: samples consumed per call */
+	int overlap;        /* ov: window overlap = algorithmic delay in samples */
+	int fft_len;        /* W = L + ov */
 	int num_bins;
 
 	float win[NS_MAX_FFT_LEN];
@@ -67,15 +68,24 @@ struct modern_ns_state {
 	int frame_count;
 };
 
+/* Low-delay analysis/synthesis window of W = L + ov samples: a power-complementary
+ * rising ramp of ov samples, a flat top of L - ov samples and the mirrored falling
+ * ramp. With a hop of L the falling ramp of one frame overlaps the rising ramp of
+ * the next in exactly ov samples, so w[i]^2 + w[i+L]^2 = 1 there and the overlap-add
+ * reconstructs perfectly. The algorithmic delay is ov samples (96 at 16 kHz, the
+ * same as WebRTC's NS). The ramp is a Vorbis-type sin(pi/2 * sin^2) curve, whose
+ * low sidelobes keep loud low-frequency speech from leaking into high bins. */
 static void ns_init_window(struct modern_ns_state *st)
 {
-	int W = 2 * st->frame_size;
+	const int L = st->frame_size, ov = st->overlap, W = L + ov;
 	for (int i = 0; i < W; i++) {
-		/* Vorbis power-complementary window: w[i]^2 + w[i+L]^2 = 1 like the sine
-		 * window, but with far lower sidelobes, so loud low-frequency speech does
-		 * not leak into high bins and inflate their noise floor. */
-		float sn = sinf((float)M_PI * ((float)i + 0.5f) / (float)W);
-		st->win[i] = sinf(0.5f * (float)M_PI * sn * sn);
+		int j = i < ov ? i : (i >= L ? W - 1 - i : -1);
+		if (j < 0) {
+			st->win[i] = 1.0f;
+		} else {
+			float sn = sinf((float)M_PI * ((float)j + 0.5f) / (2.0f * (float)ov));
+			st->win[i] = sinf(0.5f * (float)M_PI * sn * sn);
+		}
 	}
 }
 
@@ -128,14 +138,8 @@ static void ns_setup(struct modern_ns_state *st, int frame_size)
 	if (st->frame_size < 1)
 		st->frame_size = 1;
 
-	int W = 2 * st->frame_size;
-	if (W <= 256)
-		st->fft_len = 256;
-	else if (W <= 512)
-		st->fft_len = 512;
-	else
-		st->fft_len = 1024;
-
+	st->overlap = (st->frame_size * 3) / 5;
+	st->fft_len = st->frame_size + st->overlap;
 	st->num_bins = st->fft_len / 2 + 1;
 	ns_init_window(st);
 
@@ -196,19 +200,21 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 		ns_setup(st, want);
 
 	const int L = st->frame_size;
-	const int W = 2 * L;
+	const int ov = st->overlap;
+	const int W = L + ov;
 	const int N = st->fft_len;
 	const int num_bins = st->num_bins;
 
 	const float *in = in_bands[0];
 	float *out = out_bands[0];
 
+	/* Analysis frame: the last ov samples of the previous input, then this block. */
 	float fft_buf[NS_MAX_FFT_LEN] = {0};
-	for (int i = 0; i < L; i++) {
+	for (int i = 0; i < ov; i++)
 		fft_buf[i] = st->in_hist[i] * st->win[i];
-		fft_buf[i + L] = in[i] * st->win[i + L];
-	}
-	memcpy(st->in_hist, in, (size_t)L * sizeof(float));
+	for (int i = 0; i < L; i++)
+		fft_buf[i + ov] = in[i] * st->win[i + ov];
+	memcpy(st->in_hist, in + (L - ov), (size_t)ov * sizeof(float));
 
 	/* Direct RDFT */
 	audio_process_rdft(N, 1, fft_buf);
@@ -379,14 +385,19 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 	for (int i = 0; i < W; i++)
 		fft_buf[i] *= scale;
 
+	/* Overlap-add: the first ov samples complete the previous frame's falling ramp;
+	 * the rest of this block is already complete. The falling ramp is kept for the
+	 * next call. */
 	for (int i = 0; i < L; i++) {
-		out[i] = st->ola_out[i] + fft_buf[i] * st->win[i];
-		st->ola_out[i] = fft_buf[i + L] * st->win[i + L];
+		float y = fft_buf[i] * st->win[i];
+		out[i] = (i < ov) ? st->ola_out[i] + y : y;
 	}
+	for (int i = 0; i < ov; i++)
+		st->ola_out[i] = fft_buf[i + L] * st->win[i + L];
 
 	/* Upper subbands: gain from the top quarter of the low band's final gain,
 	 * smoothed in time, floored at the policy floor; the bands themselves are
-	 * delayed by one frame so they stay aligned with the low band output. */
+	 * delayed by the low band's ov samples so they stay aligned with its output. */
 	if (num_bands > 1) {
 		int k0 = (num_bins * 3) / 4;
 		float acc = 0.0f;
@@ -401,16 +412,17 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 			float *out_b = out_bands[b];
 			if (!in_b || !out_b)
 				continue;
+			/* Delay by the same ov samples as the low band; copy first because the
+			 * caller may process in place. */
 			float *h = st->hb_hist[b - 1];
+			float tmp[NS_BAND_LEN];
+			for (int i = 0; i < L; i++)
+				tmp[i] = in_b[i];
 			for (int i = 0; i < L; i++) {
-				float cur = in_b[i];
-				if (i < NS_BAND_LEN) {
-					out_b[i] = st->hb_gain * h[i];
-					h[i] = cur;
-				} else {
-					out_b[i] = st->hb_gain * cur;	/* beyond the delay line: no delay */
-				}
+				float d = (i < ov) ? h[i] : tmp[i - ov];
+				out_b[i] = st->hb_gain * d;
 			}
+			memcpy(h, tmp + (L - ov), (size_t)ov * sizeof(float));
 		}
 	}
 }

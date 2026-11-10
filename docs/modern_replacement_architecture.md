@@ -348,3 +348,28 @@ Findings from the audit:
 - Needed to settle it: the layout of the application-side struct (ask Thingino or the maintainer whether DRC+EQ has ever been enabled on T32 or T33 hardware and by what code), or behaviour of the vendor library, which this project does not read.
 - Until then, treat `drc_eq_set_config` as possibly ABI-incompatible with `libimp` on T32 and T33. The effect is off by default and exists only there.
 
+### 4.8 AGC evaluation (oracle `475278e` against HEAD; descriptive; does not change §4.2-§4.4)
+
+**Rule, written before scoring.** Config: target 3, compression gain 9 (12 for the tone gates), limiter on, modes 2 and 3, 16 kHz, 10 ms calls. Data: TCD-VoIP clean reference clips resampled to 16 kHz, development speakers FA and MK (10 clips each); the test speakers FG and ML are untouched. Input levels (active-speech RMS) -45, -35, -25, -20, -15 dBFS; the first run used -8 dBFS and wrapped around int16 because speech peaks exceed full scale, so the levels were changed before any scored run. Metrics: M1 level error against `min(-target, level + gain cap)` (pass: median |error| at most 1.5 dB and at most 0.5 dB worse than the oracle); M2 gain smoothness, the standard deviation of the frame-to-frame gain change in active speech (pass: at most 1.25 times the oracle); M3 fidelity, Zimtohrli of the output divided by its mean applied gain against the input, full length, lag logged (pass: median change at least -0.05); M4 clipped samples (pass: no more than the oracle); M5 noise gain in pauses (pass: no more than the cap + 0.5 dB). Cross-correlation lag was 0 in all 200 runs, as expected for a gain stage.
+
+**Result on the development half: FAIL on M1, M2 and M4; M3 passes overall.**
+
+| Input level (dBFS RMS) | Mode 3: median \|level error\| oracle / HEAD (dB) | Gain-change std oracle / HEAD (dB) | Clipped samples oracle / HEAD | Zimtohrli change (HEAD - oracle) |
+|---|---|---|---|---|
+| -45 | 0.13 / 0.01 | 0.01 / 0.50 | 0 / 0 | -0.019 |
+| -35 | 0.13 / 0.01 | 0.00 / 0.17 | 0 / 0 | -0.013 |
+| -25 | 1.05 / 3.11 | 0.23 / 0.26 | 0 / 0 | -0.106 |
+| -20 | 3.63 / 7.64 | 0.61 / 0.48 | 4 / 36 | -0.078 |
+| -15 | 7.92 / 11.99 | 0.79 / 0.61 | 7 / 171 | -0.053 |
+
+Medians over 20 clips; mode 2 shows the same pattern. The absolute part of M1 is badly calibrated: it compares an RMS level of speech with a target that both implementations apply to peaks, so the oracle itself exceeds 1.5 dB at high levels; the relative comparison is what carries the result. Overall medians: M1 3.11 against 1.05 dB; M2 0.44 against 0.23; M3 -0.027; clipped samples 207 against 11.
+
+**Tone gates (1 kHz sine, mode 3, target 3).** Oracle output peak lands near -3 dBFS (RMS -6.2 dBFS) for inputs of -10 to 0 dBFS; HEAD settles at RMS -9.0 dBFS for inputs of -15 to 0 dBFS, 3 dB lower, so the §4.2 target-lock gate (within 0.5 dB of the target for -15 to -3 dBFS) is not met by HEAD. A full-scale tone clips 86 samples in HEAD (122 with gain 12) and none in the oracle (the output reaches -32768 during start-up). The gain cap is met (+9.0 dB, oracle +7.9 to +8.0).
+
+**Defects found (to fix; each needs a regression test):**
+1. **The AGC target level is 3 dB too low.** `agc.c` sets the target to `32767 / sqrt(2) * 10^(-target / 20)` and treats it as a peak (16384 peak is -9 dBFS RMS for a sine), whereas the oracle, and §4.1, lock the output peak near -target dBFS. The unit test only checks "amplifies" and "no overflow", so the level was never measured.
+2. **Clipping on loud input and at start-up.** The gain starts at the maximum, so a loud first frame is boosted before the envelope reacts, and the "soft" limiter keeps only a 1/8 slope above 32000 and then clamps, so large overshoots end at the rail. HEAD clips 207 samples over the development set against 11 for the oracle.
+3. **Gain ripple.** The gain follows a 1 ms peak envelope, so its frame-to-frame change is about twice the oracle's at low levels (std 0.50 against 0.01 dB at -45 dBFS), which risks audible pumping.
+4. **The `mode` argument is stored and never read**, so modes 0-3 behave identically; the oracle's modes 2 and 3 differ (for example a different level at low input).
+5. **Call length.** The frame is cut into ten subframes of `samples / 10`; any remainder (for example 333 samples) is not processed at all. Output also depends on the call size: 80, 160 and 480-sample calls differ by up to 566 and 1498 counts in HEAD (up to 12179 in the oracle, relative RMS 0.63 against 0.02). `libimp` calls with 80 or 160 samples, so the remainder case does not occur there, but the contract should be explicit.
+

@@ -480,6 +480,96 @@ static void test_agc_guardrails(void)
 	printf("  -> PASS\n");
 }
 
+static void agc_modulated(int16_t *x, int n)
+{
+	unsigned seed = 7;
+	for (int i = 0; i < n; i++) {
+		seed = seed * 1103515245u + 12345u;
+		double env = 0.5 + 0.5 * sin(2.0 * M_PI * 1.5 * i / 16000.0);
+		double noise = (double)((int)((seed >> 16) & 0x7fff) - 16384) * 0.03;
+		x[i] = (int16_t)(5000.0 * env * sin(2.0 * M_PI * 400.0 * i / 16000.0) + noise);
+	}
+}
+
+static void agc_run(int16_t *buf, int n, int chunk, int target, int cap, int limiter)
+{
+	void *a = audio_process_agc_create();
+	WebRtcAgcConfig cfg = { .targetLevelDbfs = (int16_t)target, .compressionGaindB = (int16_t)cap,
+				.limiterEnable = (uint8_t)limiter };
+	audio_process_agc_set_config(a, 0, 255, 2, 16000, cfg);
+	int32_t mic = 100;
+	for (int i = 0; i < n; i += chunk) {
+		int c = (n - i < chunk) ? n - i : chunk;
+		const int16_t *ip = buf + i;
+		int16_t *op = buf + i;
+		uint8_t sat = 0;
+		audio_process_agc_process(a, &ip, 1, (size_t)c, &op, mic, &mic, 0, &sat);
+	}
+	audio_process_agc_free(a);
+}
+
+/* Test 8b: AGC regressions found by the evaluation against the shipped
+ * (WebRTC) AGC: level lock, rail samples, call-size dependence, remainders,
+ * and gain rising in pauses. */
+static void test_agc_regressions(void)
+{
+	printf("Running test_agc_regressions...\n");
+	const int n = 16000 * 4;
+	int16_t *x = malloc(n * sizeof(int16_t));
+	int16_t *ref = malloc(n * sizeof(int16_t));
+
+	/* 1. a steady tone settles with its peak at -target dBFS (within 0.5 dB) */
+	for (int peak_db = -15; peak_db <= -3; peak_db += 4) {
+		double amp = 32767.0 * pow(10.0, peak_db / 20.0);
+		for (int i = 0; i < n; i++)
+			x[i] = (int16_t)lrint(amp * sin(2.0 * M_PI * 1000.0 * i / 16000.0));
+		agc_run(x, n, 160, 3, 12, 1);
+		int16_t mx = 0;
+		for (int i = n - 16000; i < n; i++)
+			if (abs(x[i]) > mx) mx = (int16_t)abs(x[i]);
+		double peak = 20.0 * log10((double)mx / 32767.0);
+		ASSERT_TRUE(fabs(peak - (-3.0)) <= 0.5, "AGC tone peak locks at -target dBFS within 0.5 dB");
+	}
+
+	/* 2. a full-scale tone never reaches the rails, start-up included */
+	for (int i = 0; i < n; i++)
+		x[i] = (int16_t)lrint(32767.0 * sin(2.0 * M_PI * 1000.0 * i / 16000.0));
+	agc_run(x, n, 160, 3, 12, 1);
+	for (int i = 0; i < n; i++)
+		ASSERT_TRUE(x[i] < 32767 && x[i] > -32768, "AGC output stays below the rails");
+
+	/* 3. output does not depend on how the stream is cut into calls, and a
+	 * remainder shorter than a millisecond is processed too */
+	agc_modulated(ref, n);
+	agc_run(ref, n, n, 10, 9, 1);
+	const int cuts[5] = {80, 160, 480, 100, 333};
+	for (int c = 0; c < 5; c++) {
+		agc_modulated(x, n);
+		agc_run(x, n, cuts[c], 10, 9, 1);
+		ASSERT_TRUE(memcmp(x, ref, n * sizeof(int16_t)) == 0, "AGC output independent of call size");
+	}
+
+	/* 4. a pause must not raise the gain: after loud-ish speech, a quiet
+	 * noise bed is not amplified beyond the speech gain */
+	unsigned seed = 11;
+	for (int i = 0; i < n; i++) {
+		seed = seed * 1103515245u + 12345u;
+		double noise = (double)((int)((seed >> 16) & 0x7fff) - 16384) * 0.004; /* about -62 dBFS */
+		double speech = (i < 2 * 16000) ? 3000.0 * sin(2.0 * M_PI * 300.0 * i / 16000.0) : 0.0;
+		x[i] = (int16_t)(speech + noise);
+	}
+	memcpy(ref, x, n * sizeof(int16_t));
+	agc_run(x, n, 160, 3, 12, 1);
+	double rin = compute_rms_i16(ref, 3 * 16000, n);
+	double rout = compute_rms_i16(x, 3 * 16000, n);
+	double sp_in = compute_rms_i16(ref, 16000, 2 * 16000);
+	double sp_out = compute_rms_i16(x, 16000, 2 * 16000);
+	ASSERT_TRUE(rout / rin <= (sp_out / sp_in) * 1.05, "AGC does not raise the noise bed above the speech gain");
+
+	free(x); free(ref);
+	printf("  -> PASS\n");
+}
+
 /* Test 9: NS (Noise Suppression) E2E Regression Tests */
 static void test_ns_guardrails(void)
 {
@@ -978,6 +1068,9 @@ int main(void)
 
 	test_agc_guardrails();
 	record_quality_gate("AGC", "Target Level & Limiter Headroom", "No clipping", "Exact level locked", "PASS");
+
+	test_agc_regressions();
+	record_quality_gate("AGC", "Peak lock within 0.5 dB, no rail samples, call-size independent", "Per section 4.2 and 4.8", "Met", "PASS");
 
 	test_ns_guardrails();
 	record_quality_gate("NS", "Stationary Noise Attenuation", "> 5.0 dB", "6.8--18.8 dB", "PASS");

@@ -1073,6 +1073,86 @@ static void test_aec_guardrails(void)
 	printf("  -> PASS\n");
 }
 
+/* speech-like broadband far end: coloured noise with syllable gating, so
+ * that the echo path delay is unambiguous (a harmonic or tonal signal fits
+ * every multiple of its period) */
+static void aec_far_signal(int16_t *x, int n, int rate, unsigned seed)
+{
+	double lp = 0.0;
+	for (int i = 0; i < n; i++) {
+		double ts = (double)i / rate;
+		double gate = 0.5 + 0.5 * sin(2.0 * M_PI * 2.5 * ts);
+		seed = seed * 1103515245u + 12345u;
+		double noise = (double)((int)((seed >> 16) & 0x7fff) - 16384) / 16384.0;
+		lp = 0.6 * lp + 0.4 * noise;      /* one-pole colouring */
+		x[i] = (int16_t)(9000.0 * gate * lp);
+	}
+}
+
+/* ERLE of the AEC on a delayed, attenuated copy of a broadband far end */
+static double aec_erle(int rate, int delay_ms)
+{
+	const int n = rate * 8;
+	const int s10 = rate / 100;
+	int16_t *far = malloc(n * sizeof(int16_t));
+	int16_t *mic = malloc(n * sizeof(int16_t));
+	int16_t *ref = malloc(n * sizeof(int16_t));
+	aec_far_signal(far, n, rate, 17);
+	int d = rate * delay_ms / 1000;
+	unsigned seed = 5;
+	for (int i = 0; i < n; i++) {
+		seed = seed * 1103515245u + 12345u;
+		double noise = (double)((int)((seed >> 16) & 0x7fff) - 16384) / 16384.0 * 10.0;
+		mic[i] = (int16_t)((i >= d ? 0.5 * far[i - d] : 0.0) + noise);
+	}
+	memcpy(ref, mic, n * sizeof(int16_t));
+	struct aec_handle *h = (struct aec_handle *)audio_process_aec_create(rate, NULL);
+	for (int f = 0; f + 2 <= n / s10; f += 2) {
+		struct aec_frame frm = { .far = far + f * s10, .near = mic + f * s10, .num_bytes = 2 * s10 * 2 };
+		audio_process_aec_process(h, &frm);
+	}
+	audio_process_aec_free(h);
+	double ein = 0.0, eout = 0.0;
+	for (int i = n - 3 * rate; i < n; i++) {
+		if (abs(far[i]) > 800) {
+			ein += (double)ref[i] * ref[i];
+			eout += (double)mic[i] * mic[i];
+		}
+	}
+	free(far); free(mic); free(ref);
+	return 10.0 * log10(ein / (eout > 1.0 ? eout : 1.0));
+}
+
+/* Test 10b: the AEC cancels a broadband echo across realistic path delays
+ * (the single-tone test above cannot tell a delay from its multiples), and
+ * leaves the near end alone when the far end is silent */
+static void test_aec_delay_paths(void)
+{
+	printf("Running test_aec_delay_paths...\n");
+	const int delays[3] = {20, 60, 100};
+	for (int i = 0; i < 3; i++)
+		ASSERT_TRUE(aec_erle(16000, delays[i]) > 15.0, "AEC cancels a broadband echo (ERLE > 15 dB) at 16 kHz");
+	ASSERT_TRUE(aec_erle(8000, 100) > 15.0, "AEC cancels a broadband echo (ERLE > 15 dB) at 8 kHz");
+
+	/* far end silent: the near end passes unchanged (apart from the added latency) */
+	const int rate = 16000, n = rate * 3;
+	int16_t *near = malloc(n * sizeof(int16_t));
+	int16_t *far = calloc(n, sizeof(int16_t));
+	aec_far_signal(near, n, rate, 3);
+	int16_t *ref = malloc(n * sizeof(int16_t));
+	memcpy(ref, near, n * sizeof(int16_t));
+	struct aec_handle *h = (struct aec_handle *)audio_process_aec_create(rate, NULL);
+	for (int f = 0; f + 2 <= n / 160; f += 2) {
+		struct aec_frame frm = { .far = far + f * 160, .near = near + f * 160, .num_bytes = 640 };
+		audio_process_aec_process(h, &frm);
+	}
+	audio_process_aec_free(h);
+	double in_rms = compute_rms_i16(ref, rate, n - 2000), out_rms = compute_rms_i16(near, rate + 400, n);
+	ASSERT_TRUE(fabs(20.0 * log10(out_rms / in_rms)) < 1.0, "AEC leaves the near end alone when the far end is silent");
+	free(near); free(far); free(ref);
+	printf("  -> PASS\n");
+}
+
 /* Test 11: Real-valued FFT / IFFT Roundtrip & Energy Conservation */
 static void test_fft_guardrails(void)
 {
@@ -1175,6 +1255,7 @@ int main(void)
 	record_quality_gate("NS", "Speech Transparency & Robustness", "< 3 dB speech loss", "Within gates", "PASS");
 
 	test_aec_guardrails();
+	test_aec_delay_paths();
 	record_quality_gate("AEC", "Echo Return Loss (ERLE)", "> 6.0 dB", "> 130 dB", "PASS");
 
 	test_fft_guardrails();

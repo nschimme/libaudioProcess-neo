@@ -30,9 +30,33 @@
 #define AEC_MAX_BLOCK_LEN   128
 #define AEC_MAX_FFT_LEN     256
 #define AEC_MAX_BINS        (AEC_MAX_FFT_LEN / 2 + 1)  /* 129 bins */
-#define AEC_NUM_PARTITIONS  16
+#define AEC_NUM_PARTITIONS  32
 #define AEC_MAX_DELAY_SAMP  4800                       /* Up to 100ms at 48kHz */
 #define AEC_FIFO_SIZE       4096                       /* Ample headroom for framing */
+#ifndef AEC_TRACK_PEAKY
+#define AEC_TRACK_PEAKY     0.2f  /* a bin holding more of the far-end power than this is a tone */
+#endif
+#ifndef AEC_TRACK_BLOCKS
+#define AEC_TRACK_BLOCKS    8     /* adapting blocks between delay checks */
+#endif
+#ifndef AEC_TRACK_LATE
+#define AEC_TRACK_LATE      8     /* echo peak at or beyond this partition counts as late */
+#endif
+#ifndef AEC_TRACK_CONFIRM
+#define AEC_TRACK_CONFIRM   10    /* consecutive late checks before the delay moves */
+#endif
+#ifndef AEC_TRACK_KEEP
+#define AEC_TRACK_KEEP      3     /* partitions of lead kept in front of the echo peak */
+#endif
+#ifndef AEC_MU0
+#define AEC_MU0             0.4f
+#endif
+#ifndef AEC_MU_MIN
+#define AEC_MU_MIN          0.3f
+#endif
+#ifndef AEC_MU_DECAY
+#define AEC_MU_DECAY        0.9995f
+#endif
 
 struct aec_state {
 	int block_len;            /* L: frame partition length (e.g. 64 or 128) */
@@ -64,6 +88,9 @@ struct aec_state {
 	float X_re[AEC_NUM_PARTITIONS][AEC_MAX_BINS];
 	float X_im[AEC_NUM_PARTITIONS][AEC_MAX_BINS];
 	int x_pos;
+	int track_count;     /* adaptation blocks since the last delay check */
+	int track_late;      /* consecutive checks with the echo peak in a late partition */
+	int constrain_pos;   /* next partition whose gradient is constrained (round robin) */
 
 	/* Split-complex adaptive filter weights: W_re[p][k], W_im[p][k] */
 	float W_re[AEC_NUM_PARTITIONS][AEC_MAX_BINS];
@@ -243,8 +270,15 @@ static void pbfdaf_process_block(struct aec_state *st,
 						      E_re, E_im,
 						      st->X_re[idx], st->X_im[idx],
 						      step_bins, K);
+		}
 
-			/* Constrained gradient: IFFT -> zero uncausal half -> forward FFT */
+		/* Constrain ONE partition per block, round robin (zero the
+		 * uncausal half of its impulse response). All partitions get the
+		 * constraint every P blocks; it costs two transforms per block
+		 * instead of 2P. */
+		{
+			int p = st->constrain_pos;
+			st->constrain_pos = (p + 1) % P;
 			float w_time[AEC_MAX_FFT_LEN];
 			audio_process_rdft_inverse(N, st->W_re[p], st->W_im[p], w_time);
 
@@ -254,6 +288,59 @@ static void pbfdaf_process_block(struct aec_state *st,
 			}
 			memset(w_time + L, 0, L * sizeof(float));
 			audio_process_rdft_forward(N, w_time, st->W_re[p], st->W_im[p]);
+		}
+
+		/* Delay tracking: if the echo peak of the adaptive filter sits in a
+		 * late partition for a while, delay the far-end reference by that
+		 * amount and shift the weights down, so the filter span is spent on
+		 * the echo instead of on the dead time before it. */
+		if (++st->track_count >= AEC_TRACK_BLOCKS) {
+			st->track_count = 0;
+
+			/* A narrowband reference (a tone, a hum) has no unique delay:
+			 * every multiple of its period fits. Only track a broadband one. */
+			float pw_sum = 0.0f, pw_max = 0.0f;
+			for (int k = 0; k < K; k++) {
+				pw_sum += st->power_X[k];
+				if (st->power_X[k] > pw_max)
+					pw_max = st->power_X[k];
+			}
+			int broadband = pw_max < AEC_TRACK_PEAKY * pw_sum;
+
+			float best = 0.0f, total = 0.0f;
+			int pk = 0;
+			for (int p = 0; p < P; p++) {
+				float e = 0.0f;
+				for (int k = 0; k < K; k++)
+					e += st->W_re[p][k] * st->W_re[p][k] + st->W_im[p][k] * st->W_im[p][k];
+				total += e;
+				if (e > best) { best = e; pk = p; }
+			}
+			if (broadband && total > 0.0f && best > 0.3f * total && pk >= AEC_TRACK_LATE) {
+				if (++st->track_late >= AEC_TRACK_CONFIRM) {
+					int shift = pk - AEC_TRACK_KEEP;
+					int room = (AEC_MAX_DELAY_SAMP - 1 - st->delay_samples) / L;
+					if (shift > room)
+						shift = room;
+					if (shift > 0) {
+						st->delay_samples += shift * L;
+						for (int p = 0; p + shift < P; p++) {
+							memcpy(st->W_re[p], st->W_re[p + shift], sizeof(st->W_re[p]));
+							memcpy(st->W_im[p], st->W_im[p + shift], sizeof(st->W_im[p]));
+						}
+						for (int p = P - shift; p < P; p++) {
+							memset(st->W_re[p], 0, sizeof(st->W_re[p]));
+							memset(st->W_im[p], 0, sizeof(st->W_im[p]));
+						}
+						memset(st->X_re, 0, sizeof(st->X_re));
+						memset(st->X_im, 0, sizeof(st->X_im));
+						memset(st->x_old, 0, sizeof(st->x_old));
+					}
+					st->track_late = 0;
+				}
+			} else {
+				st->track_late = 0;
+			}
 		}
 
 		if (st->mu > st->mu_min) {
@@ -354,9 +441,9 @@ void *audio_process_aec_create(int sample_rate, const char *profile_path)
 			st->delay_samples = AEC_MAX_DELAY_SAMP - 1;
 	}
 
-	st->mu = (cfg.user_mode && cfg.mu_min > 0.0f) ? 0.35f : 0.25f;
-	st->mu_min = (cfg.user_mode && cfg.mu_min > 0.0f) ? cfg.mu_min : 0.05f;
-	st->mu_decay = (cfg.user_mode && cfg.mu_decay > 0.0f) ? cfg.mu_decay : 0.998f;
+	st->mu = (cfg.user_mode && cfg.mu_min > 0.0f) ? 0.35f : AEC_MU0;
+	st->mu_min = (cfg.user_mode && cfg.mu_min > 0.0f) ? cfg.mu_min : AEC_MU_MIN;
+	st->mu_decay = (cfg.user_mode && cfg.mu_decay > 0.0f) ? cfg.mu_decay : AEC_MU_DECAY;
 	st->far_pow_thd = (cfg.user_mode && cfg.far_pow_thd > 0.0f) ? cfg.far_pow_thd : 50.0f;
 	st->safe_suppression = (cfg.user_mode && cfg.safe_suppression > 0.0f) ? cfg.safe_suppression : 1.0f;
 	st->chassis_margin_db = 4.5f;
@@ -397,21 +484,15 @@ int audio_process_aec_process(struct aec_handle *h, struct aec_frame *f)
 	int16_t *near_ptr = f->near;
 
 	for (int frm = 0; frm < num_frames; frm++) {
-		/* Apply far-end delay compensation in a circular ring buffer */
-		if (st->delay_samples > 0) {
-			for (int i = 0; i < samples_10ms; i++) {
-				float delayed_val = st->far_delay_buf[st->delay_idx];
-				st->far_delay_buf[st->delay_idx] = (float)far_ptr[i] * far_gain;
-				st->delay_idx++;
-				if (st->delay_idx >= st->delay_samples)
-					st->delay_idx = 0;
-
-				st->far_fifo[st->far_avail++] = delayed_val;
-			}
-		} else {
-			for (int i = 0; i < samples_10ms; i++) {
-				st->far_fifo[st->far_avail++] = (float)far_ptr[i] * far_gain;
-			}
+		/* Far-end delay compensation (configured plus tracked) in a ring buffer */
+		for (int i = 0; i < samples_10ms; i++) {
+			st->far_delay_buf[st->delay_idx] = (float)far_ptr[i] * far_gain;
+			int rd = st->delay_idx - st->delay_samples;
+			if (rd < 0)
+				rd += AEC_MAX_DELAY_SAMP;
+			st->far_fifo[st->far_avail++] = st->far_delay_buf[rd];
+			if (++st->delay_idx >= AEC_MAX_DELAY_SAMP)
+				st->delay_idx = 0;
 		}
 
 		for (int i = 0; i < samples_10ms; i++) {

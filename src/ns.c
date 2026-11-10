@@ -5,6 +5,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <math.h>
 
 #ifndef M_PI
@@ -86,6 +87,22 @@ void *audio_process_ns_create(void)
 
 	audio_process_ns_set_config(st, 16000, 2);
 	return st;
+}
+
+/* exp(-v) for 0 <= v <= 20, relative error about 1e-6: range reduction to 2^x with
+ * a degree-5 polynomial for the fraction and the exponent set through the float
+ * bits. Cheaper than expf and needs no table. */
+static float ns_fast_exp_neg(float v)
+{
+	float x = -v * 1.44269504f;
+	int i = (int)x;
+	if ((float)i > x)
+		i--;
+	float f = x - (float)i;
+	float p = 1.0f + f * (0.69314718f + f * (0.24022651f + f * (0.05550411f + f * (0.00961813f + f * 0.00133336f))));
+	union { float f; uint32_t u; } e = { 0 };
+	e.u = (uint32_t)(i + 127) << 23;
+	return p * e.f;
 }
 
 /* Samples consumed per call: the NS takes no length parameter, so every call
@@ -283,15 +300,22 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 	 * inside a speech frame / harmonic neighbourhood are not floored. */
 	float spp_l[NS_MAX_BINS];
 	float frame_p = 0.0f;
-	for (int k = 0; k < num_bins; k++) {
-		float acc = 0.0f;
+	{
+		/* Running window sum over +-NS_SPP_SPAN bins instead of re-summing each
+		 * window: the windows are narrow at the edges, so the count is tracked. */
+		float win = 0.0f;
 		int cnt = 0;
-		for (int d = -NS_SPP_SPAN; d <= NS_SPP_SPAN; d++) {
-			int j = k + d;
-			if (j >= 0 && j < num_bins) { acc += st->spp[j]; cnt++; }
+		for (int j = 0; j <= NS_SPP_SPAN && j < num_bins; j++) {
+			win += st->spp[j];
+			cnt++;
 		}
-		spp_l[k] = acc / (float)cnt;
-		frame_p += st->spp[k];
+		for (int k = 0; k < num_bins; k++) {
+			spp_l[k] = win / (float)cnt;
+			frame_p += st->spp[k];
+			int add = k + NS_SPP_SPAN + 1, sub = k - NS_SPP_SPAN;
+			if (add < num_bins) { win += st->spp[add]; cnt++; }
+			if (sub >= 0) { win -= st->spp[sub]; cnt--; }
+		}
 	}
 	frame_p = NS_FRAME_P_GAIN * (frame_p / (float)num_bins);
 	if (frame_p > 1.0f)
@@ -326,7 +350,7 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 		if (v > 20.0f) {
 			pr = 1.0f;
 		} else {
-			float lr = (q / (1.0f - q)) * (1.0f + xi) * expf(-v);
+			float lr = (q / (1.0f - q)) * (1.0f + xi) * ns_fast_exp_neg(v);
 			pr = 1.0f / (1.0f + lr);
 		}
 		if (frame_p > pr) pr = frame_p;

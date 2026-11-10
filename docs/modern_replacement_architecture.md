@@ -416,3 +416,37 @@ Medians over 20 clips. In mode 2 the oracle itself is 3 dB below the ideal at -4
 - `num_bands` is the literal 1 at all 19 located `agc_process` call sites in the 38 sampled `libimp` builds, so the multi-band path of the AGC has no known caller (it is kept, untested, for the exported signature).
 - The AGC mode: `libimp` exports `IMP_AI_SetAgcMode(int mode)` (accepts 0 to 3) and a global `agcMode` whose initial value is 2; the 21 call sites that load the mode from memory read that global. Neither raptor nor prudynt-t calls `IMP_AI_SetAgcMode`, so on Thingino the library always receives mode 2 and the ignored `mode` argument (defect 4) has no effect there. It stays a gap for other callers: modes 0, 1 and 3 behave like mode 2.
 
+### 4.9 AEC evaluation, "before" row (oracle `475278e` against the branch; descriptive; does not change §4.2-§4.4)
+
+No change was made to `aec.c`. This section records the measurement and the defects so that any fix is a separate, evidence-based decision.
+
+**Facts fixed first.** (a) In all 48 located `aec_process` call sites of the 38 sampled `libimp` builds, the word at offset 0x8 of the frame (`reserved`) is stored from the same register as `near`: it is a second pointer equal to the output buffer, so the in-place write is consistent with the vendor call. (b) The vendor `webrtc_profile.ini` is installed from the SDK (`ingenic-sdk`) and was not available, so both libraries ran with no profile (library defaults: delay-agnostic, extended filter, moderate NLP, `delay_ms` 0). (c) In raptor the AEC is off by default and needs `ao_enabled`. (d) Calls carry two 10 ms frames (raptor's 20 ms capture frames). (e) `IMP_AI_EnableAec` has no rate constants (only a channel test), so 8 and 16 kHz are scored and 32/48 kHz are not.
+
+**Rule, written before scoring** (rate 16 kHz primary, 8 kHz secondary): synthetic streams of far-end speech through a seeded echo path (direct delay d plus an exponentially decaying tail, RT60 150 ms, coupling -6 dB, mild loudspeaker soft clipping, microphone noise -65 dBFS), segments A far-only 8 s, B double talk 6 s, C far-only 5 s, D near-only 4 s, E far-only with a changed echo path 6 s; far and near speakers differ; d of 20, 60 and 100 ms (180 ms at 8 kHz); echo 0 and +6 dB against the near speech. Outputs are advanced by the measured latency (oracle 112 samples at both rates; candidate 160 at 16 kHz and 80 at 8 kHz) before comparison. Pass rules: R1 steady ERLE at least the oracle's minus 3 dB and at least 25 dB where the oracle reaches 25; R2 convergence to 15 dB under 500 ms and at most 100 ms slower than the oracle; R3 double talk: Zimtohrli change at least -0.05, near-speech gain within 1.0 dB, echo return loss at least the oracle's minus 3 dB; R4 recovery after double talk; R5 transparency with the far end silent; R6 reconvergence after a path change; R7 any delay row the oracle cancels (15 dB) and the candidate does not is a fail. The test speakers (FG, ML) are unspent.
+
+**Result on the development half (medians over 4 instances per row; steady ERLE in dB).**
+
+| Rate | Path delay | ERLE oracle / candidate | Convergence to 15 dB (s) | Reconvergence after path change | Double-talk near-speech gain (dB) | Zimtohrli change in double talk | Verdict |
+|---|---|---|---|---|---|---|---|
+| 16 kHz | 20 ms | 31.9 / 23.8 | 0.91 / 1.52 | 0 / 4.7 s (3 of 4 ever) | -5.0 to -6.4 / -1.5 to -2.7 | +0.20 to +0.25 | R1, R2, R6 fail |
+| 16 kHz | 60 ms | 32.6 / 9.2 | 1.20 / 2.54 | 0 / never | -4.3 to -5.8 / -1.1 to -2.0 | -0.43 to -0.55 | R1, R2, R6, R7 fail |
+| 16 kHz | 100 ms | 34.3 / 1.8 | 1.21 / never | 0 / never | -4.1 to -5.7 / -0.4 to -0.8 | -0.87 to -0.89 | R1, R2, R6, R7 fail |
+| 8 kHz | 20 ms | 34.2 / 22.2 | 0.91 / 2.08 | 0 / 3.3 s (1 to 2 of 4 ever) | -5.6 to -7.8 / -1.3 to -2.4 | -0.27 to -0.68 | R1, R2, R6 fail |
+| 8 kHz | 60 ms | 34.9 / 22.0 | 1.21 / 1.90 | 0 / 3.9 s (1 of 4) | -5.0 to -7.0 / -1.2 to -2.2 | -0.18 to -0.30 | R1, R2, R6 fail |
+| 8 kHz | 100 ms | 35.3 / 18.1 | 1.20 / 2.31 | 0 / 1.0 s (1 of 4) | -4.9 to -6.3 / -1.0 to -1.9 | -0.51 to -0.69 | R1, R2, R6 fail |
+| 8 kHz | 180 ms | 35.1 / 1.4 | 1.27 / never | 0 / never | -4.7 to -6.3 / -0.5 to -0.9 | -0.68 to -0.76 | R1, R2, R6, R7 fail |
+
+- Transparency with the far end silent (R5) is equal to the oracle in every row (level change within 0.01 dB, Zimtohrli change within -0.011), and a far end that is silent throughout leaves the microphone signal unchanged in both.
+- Both libraries miss the §4.2 convergence gate (under 500 ms) on this harder synthetic path (long tail, nonlinearity, noise); the oracle needs 0.9 to 1.3 s. The §4.1 profile (20 ms delay, no tail) is easier.
+- The shipped AEC attenuates the near-end speech in double talk by 4 to 8 dB; the candidate by 0.4 to 2.7 dB, which is why its double-talk fidelity is better at 20 ms.
+- Steady ERLE is below the §4.2 degraded gate (25 dB) for the candidate in every row, and 8 to 33 dB below the oracle once the path delay reaches 60 ms at 16 kHz or 180 ms at 8 kHz.
+
+**Defects found (to fix; each needs a decision and a regression test).**
+1. **Delay reach.** The candidate's filter spans 16 partitions of one block, 64 ms at 16 kHz, 128 ms at 8 kHz and about 43 ms above 16 kHz, with no delay estimator, so any speaker-to-microphone latency plus tail beyond that is not cancelled (100 ms at 16 kHz: 1.8 dB). The shipped AEC estimates the delay itself. The profile `delay_ms` delays the FAR end, which can only make a positive echo delay worse, so it cannot compensate. On real cameras the playback-to-capture latency is unmeasured; if it exceeds a few tens of milliseconds the AEC is ineffective.
+2. **Convergence and path-change recovery are slow:** 1.5 to 2.5 s to 15 dB against 0.9 to 1.3 s, and after an echo-path change the ERLE recovers to 10 dB or less within 6 s (16 kHz, 20 ms) where the oracle holds 31 to 36 dB.
+3. **Steady ERLE is 8 dB below the oracle even with a short path** (23.8 against 31.9 dB at 16 kHz and 20 ms).
+4. **Added capture latency of one full 10 ms frame** (oracle 7 ms at 16 kHz, 14 ms at 8 kHz): the candidate buffers whole 64-sample blocks and returns zeros for the first 10 ms.
+5. **Both libraries** leave samples that do not fill a whole 10 ms frame unprocessed (a 15 ms call cleans only the first 10 ms), so the contract is "multiples of 10 ms" and a caller that sends anything else leaks echo. Output is otherwise independent of 1, 2 or 4 frames per call.
+6. **Throughput:** CI shows 0.03 to 0.04 MS/s for the candidate under QEMU MIPS against the §4.2 gate of 0.15 MS/s (x86 host 3.4 MS/s); the baseline column is the same code, so it says nothing against the WebRTC AEC. Real-hardware throughput is unmeasured.
+- Caveats: the oracle host build runs WebRTC's generic C path, not the device's MIPS path; no vendor profile was available; the synthetic path is a model, not a camera chassis. The 8 kHz dev run is on the same speakers and variants (2 pairings, 2 variants).
+

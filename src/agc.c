@@ -21,7 +21,7 @@
  *  - The target is a PEAK level, 32767 * 10^(-targetLevelDbfs / 20): a sine
  *    settles with its peak at -target dBFS, as the shipped WebRTC AGC does.
  *  - The gain starts at unity and is never above 10^(compressionGaindB / 20)
- *    (internally limited to 60 dB).
+ *    (internally limited to 54 dB).
  *  - Gain is held (not raised) while the envelope is at the noise floor or
  *    without speech, and pauses get a slow -2.3 dB attenuation, so steady
  *    noise is never boosted.
@@ -29,7 +29,10 @@
  *    never reaches 32767. With the limiter off it is clamped.
  *
  * Number formats: envelope, speech reference and floor are peak counts in
- * Q15; gains are Q16 (goal) and Q32 (the running per-sample gain).
+ * Q15; the block goal is Q16 and the running per-sample gain is Q22 (so the
+ * gain is limited internally to 54 dB). The envelope coefficients are
+ * powers of two, and the sample multiply stays within 32 bits up to 30 dB of
+ * gain; above that a 64-bit multiply is used.
  */
 
 #define AGC_ATTACK_MS    1.0f    /* envelope rises towards a louder sample */
@@ -48,7 +51,7 @@
 #define AGC_PAUSE_OUT_Q  1311    /* 0.020 per block back to unity */
 #define AGC_LIM_THR      29500
 #define AGC_CHUNK        256
-#define AGC_MAX_GAIN_Q16 (1000 << 16) /* 60 dB */
+#define AGC_MAX_GAIN_Q16 (500 << 16)  /* 54 dB */
 
 struct modern_agc {
 	int min_level;
@@ -60,15 +63,15 @@ struct modern_agc {
 	/* parameters derived from the configuration */
 	int32_t target_peak;  /* peak count the gain steers towards */
 	int32_t max_gain_q16; /* 10^(compressionGaindB / 20), at most 60 dB */
-	int32_t att_q16;      /* envelope attack coefficient */
-	int32_t rel_q24;      /* 1 - envelope release multiplier, in Q24 */
+	int att_shift;        /* envelope attack: one share of 2^-att_shift per sample */
+	int rel_shift;        /* envelope release: one share of 2^-rel_shift per sample */
 	int sub_len;          /* samples per gain update, a power of two */
 	int sub_shift;        /* log2(sub_len) */
 
 	/* streaming state */
 	int32_t env;          /* peak envelope, Q15 */
-	int64_t gain;         /* gain applied to the next sample, Q32 */
-	int64_t gain_step;    /* per-sample ramp towards the block goal, Q32 */
+	int32_t gain;         /* gain applied to the next sample, Q22 */
+	int32_t gain_step;    /* per-sample ramp towards the block goal, Q22 */
 	int32_t gain_goal;    /* gain at the end of the current block, Q16 */
 	int32_t speech_ref;   /* slow peak of the envelope, Q15 */
 	int32_t floor_est;    /* envelope minimum, Q15 */
@@ -86,13 +89,17 @@ static void agc_prepare(struct modern_agc *st)
 	st->target_peak = (int32_t)(tgt + 0.5f);
 	if (st->target_peak < 1)
 		st->target_peak = 1;
-	if (mg > 1000.0f)
-		mg = 1000.0f;
+	if (mg > 500.0f)
+		mg = 500.0f;
 	st->max_gain_q16 = (int32_t)(mg * 65536.0f);
-	st->att_q16 = (int32_t)((1.0f - expf(-1000.0f / (AGC_ATTACK_MS * fs))) * 65536.0f + 0.5f);
-	st->rel_q24 = (int32_t)((1.0f - expf(-1000.0f / (AGC_RELEASE_MS * fs))) * 16777216.0f + 0.5f);
-	if (st->rel_q24 < 1)
-		st->rel_q24 = 1;
+
+	/* attack about 1 ms, release about 300 ms, rounded to powers of two */
+	st->att_shift = 0;
+	while ((float)(2 << st->att_shift) <= AGC_ATTACK_MS * fs / 1000.0f * 1.414f && st->att_shift < 16)
+		st->att_shift++;
+	st->rel_shift = 0;
+	while ((float)(2 << st->rel_shift) <= AGC_RELEASE_MS * fs / 1000.0f * 1.414f && st->rel_shift < 24)
+		st->rel_shift++;
 
 	st->sub_shift = 0;
 	while ((2 << st->sub_shift) <= st->sample_rate / 1000 && st->sub_shift < 10)
@@ -100,7 +107,7 @@ static void agc_prepare(struct modern_agc *st)
 	st->sub_len = 1 << st->sub_shift;
 
 	st->env = 0;
-	st->gain = (int64_t)1 << 32;
+	st->gain = 1 << 22;
 	st->gain_goal = 1 << 16;
 	st->gain_step = 0;
 	st->speech_ref = 0;
@@ -228,8 +235,8 @@ static void agc_block_update(struct modern_agc *st)
 	else
 		st->pause += (int32_t)(((int64_t)((1 << 16) - st->pause) * AGC_PAUSE_OUT_Q) >> 16);
 
-	int64_t start = (int64_t)cur * st->pause_applied;      /* Q32 */
-	int64_t end = (int64_t)goal * st->pause;               /* Q32 */
+	int32_t start = (int32_t)(((int64_t)cur * st->pause_applied) >> 10); /* Q22 */
+	int32_t end = (int32_t)(((int64_t)goal * st->pause) >> 10);          /* Q22 */
 	st->gain_goal = goal;
 	st->gain = start;
 	st->gain_step = (end - start) >> st->sub_shift;
@@ -266,15 +273,20 @@ int audio_process_agc_process(void *agc, const int16_t *const *in_near,
 			int32_t a = (x < 0 ? -x : x) << 15;
 
 			if (a > st->env)
-				st->env += (int32_t)(((int64_t)(a - st->env) * st->att_q16) >> 16);
+				st->env += (a - st->env) >> st->att_shift;
 			else
-				st->env -= (int32_t)(((int64_t)st->env * st->rel_q24) >> 24);
+				st->env -= st->env >> st->rel_shift;
 
-			int32_t g = (int32_t)(st->gain >> 16); /* Q16 */
+			int32_t g = st->gain >> 6; /* Q16 for the band copies */
 			gains[i] = g;
+			int32_t g11 = st->gain >> 11;
 			st->gain += st->gain_step;
 
-			int32_t y = (int32_t)(((int64_t)x * g + 32768) >> 16);
+			int32_t y;
+			if (g11 <= 65535)
+				y = (x * g11 + 1024) >> 11; /* fits 32 bits up to 30 dB */
+			else
+				y = (int32_t)(((int64_t)x * g11 + 1024) >> 11);
 			if (y > 32000 || y < -32000)
 				saturated = 1;
 			s_out[i] = agc_out(y, limiter_on);

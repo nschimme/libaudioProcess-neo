@@ -307,3 +307,10 @@ Defects found while checking the modernisation. They are quality bugs, not accep
 
 1. **Howling suppression (HS) ignores most of each call (inherited from `475278e`, unchanged in HEAD).** `audio_process_hs_process` works only on whole 128-sample blocks (`num_samples / HD_FFT_SIZE`) and leaves the remainder untouched, with no carry-over between calls. `libimp` calls the library with one 10 ms frame (80 samples at 8 kHz, 160 at 16 kHz). At 8 kHz that is zero blocks, so HS is a no-op: a sustained 2.5 kHz howl passed through unchanged in both builds. At 16 kHz one block is processed and the last 32 samples of every call (20%) are never filtered and never analysed, which also leaves a discontinuity at each block edge. Verified by reading `src/howling.c` and by running both builds on sustained tones. Fix: buffer the input across calls, or process any length with streaming state, and add a test that HS attenuates a steady tone at 8 and 16 kHz with 80- and 160-sample calls.
 
+**Process.** Every module evaluation (AGC, AEC, and any later change) includes a defect sweep next to the quality scores: call-size independence (80, 160 and 480 samples per call), digital silence, full-scale input, 8 and 16 kHz, state reset, and in-place use. Every defect found goes in this section whether or not it is a regression.
+
+**Observations still to investigate (not yet classified as defects).**
+- AGC output depends on how the stream is cut into calls: on a modulated tone plus noise at 16 kHz, 80-sample and 160-sample calls differ by up to 566 counts in HEAD (6364 in `475278e`). `libimp` always calls with one 10 ms frame, so this may be harmless in practice; it needs a check against the AGC's intended frame size before it is called a bug or accepted.
+- `audio_process_drc_eq_process` always processes `rate / 100` samples and has no length argument (an ABI property); a caller passing a shorter buffer would be read past its end. Confirm `libimp` always passes a full 10 ms frame, and consider documenting or guarding it.
+- HPF, LPF and DRC give identical output for 80-, 160- and 480-sample calls in both builds.
+

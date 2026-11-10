@@ -646,7 +646,37 @@ static void ns_regressions_at_rate(int rate, void *(*create)(void), int (*set_co
 		nfree(ns);
 	}
 
-	/* 6. set_config resets the state: a reused instance equals a fresh one. */
+	/* 6. The output must stay inside the int16 range even for full-scale, clipped input.
+	 * libimp converts our float output back with a truncation and a 16-bit store and no
+	 * clamp, so any value beyond +-32767 would wrap into a full-scale click. The WebRTC
+	 * NS this replaces saturates internally, so the caller never needed to. */
+	{
+		void *ns = create();
+		set_config(ns, rate, 2);
+		const int total = rate * 6;
+		float *loud = malloc(total * sizeof(float)), *lo = malloc(total * sizeof(float));
+		unsigned seed = 33;
+		for (int i = 0; i < total; i++) {
+			double t = (double)i / rate, v = 0.0;
+			for (int h = 1; h <= 10; h++)
+				v += sin(2.0 * M_PI * 150.0 * h * t + h * 0.3) / h;
+			int burst = (i / 6400) % 2 == 0 && i > 3200;   /* bursts of loud voice */
+			double s = burst ? 60000.0 * 0.6 * v : 0.0;
+			s += ((double)(rand_r(&seed) % 2000) - 1000.0) * 0.4;
+			loud[i] = (float)(s > 32767.0 ? 32767.0 : (s < -32768.0 ? -32768.0 : s));
+		}
+		ns_run(ns, proc, loud, lo, total, frame, 0);
+		float peak = 0.0f;
+		for (int i = 0; i < total; i++)
+			if (fabsf(lo[i]) > peak)
+				peak = fabsf(lo[i]);
+		ASSERT_TRUE(peak <= 32768.0f, "NS output stays inside the int16 range for full-scale clipped input");
+		free(loud);
+		free(lo);
+		nfree(ns);
+	}
+
+	/* 7. set_config resets the state: a reused instance equals a fresh one. */
 	{
 		void *a = create(), *b = create();
 		set_config(a, rate, 2);

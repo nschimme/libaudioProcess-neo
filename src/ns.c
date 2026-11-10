@@ -117,6 +117,19 @@ static float ns_fast_exp_neg(float v)
 	return p * e.f;
 }
 
+/* Saturate to the int16 range. The caller (libimp) converts our float output back
+ * with a truncation and a 16-bit store and no clamp, so a value outside the range
+ * would wrap into a full-scale click. The gain is at most 1, but the overlap-add of
+ * frames with different gains can overshoot a full-scale input. */
+static inline float ns_sat(float v)
+{
+	if (v > 32767.0f)
+		return 32767.0f;
+	if (v < -32768.0f)
+		return -32768.0f;
+	return v;
+}
+
 /* Samples consumed per call: the NS takes no length parameter, so every call
  * must consume exactly one block of band 0 (80 samples at 8 kHz, 160 at 16 kHz
  * and above), the same block length as WebRTC's NS. Slicing the capture stream
@@ -414,7 +427,7 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 	 * next call. */
 	for (int i = 0; i < L; i++) {
 		float y = fft_buf[i] * st->win[i];
-		out[i] = (i < ov) ? st->ola_out[i] + y : y;
+		out[i] = ns_sat((i < ov) ? st->ola_out[i] + y : y);
 	}
 	for (int i = 0; i < ov; i++)
 		st->ola_out[i] = fft_buf[i + L] * st->win[i + L];
@@ -444,7 +457,7 @@ void audio_process_ns_process(void *ns, const float *const *in_bands,
 				tmp[i] = in_b[i];
 			for (int i = 0; i < L; i++) {
 				float d = (i < ov) ? h[i] : tmp[i - ov];
-				out_b[i] = st->hb_gain * d;
+				out_b[i] = ns_sat(st->hb_gain * d);
 			}
 			memcpy(h, tmp + (L - ov), (size_t)ov * sizeof(float));
 		}

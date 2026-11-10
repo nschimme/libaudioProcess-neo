@@ -332,12 +332,12 @@ Method: for 38 `libimp.so` builds (one per SoC and SDK version, `gtxaspec/ingeni
 | `hs_process` | T23, T32, T33, T40, T41 (not T31, A1, C100, T20, T21, T30) | yes (19 builds) | **`(handle, buf, buf, n)` four arguments**; `n` loaded from offset 0x10 of an audio frame/attribute struct, most likely samples per frame | **no (three arguments)** |
 | `hs_create` | same as `hs_process` | none located on T23, T32, T33* | not established | unverified |
 | `drc_eq_process` | T32, T33 | yes | `(handle, in, out)` three arguments, no length | yes |
-| `drc_eq_set_config` | T32, T33 | yes | register arguments plus **five** stack arguments (nine in total) | **no? this library declares eight; recheck** |
+| `drc_eq_set_config` | T32, T33 | yes | **nine arguments**: handle, then eight scalars read from consecutive words (offsets 0x0-0x1c) of a configuration struct; three register slots and five stack slots, all stored before the call and not read back (T32 1.0.4, T32 2.2.0, T33 2.0.2.1) | **no: this library declares eight** |
 | `drc_create/set_config/process/free` | **T31** and T41 | yes (T31 `drc_create` and `drc_set_config` not located*) | not yet read | unverified |
 | `lpf_create`, `lpf_process` | T32, T33 | yes (through a `libimp` wrapper that halves a byte count) | not yet read | unverified |
 
 Findings from the audit:
 - The header comment ties plain DRC to "T41 ZRT", but `libimp` also references it on T31 builds (T31 is the main Thingino SoC), so DRC is reachable from `libimp` on the most common camera (it is off by default), not a niche path.
-- `hs_process` argument-count mismatch and the `drc_eq_set_config` argument-count question are defects to resolve before anything is shipped that enables those effects. The latter is flagged, not confirmed: the stores were counted from one disassembly window and need a full trace.
+- `hs_process` argument-count mismatch and the `drc_eq_set_config` argument-count question are defects to resolve before anything is shipped that enables those effects. The `drc_eq_set_config` count is now confirmed on three builds. What is not known is which position the extra argument has: there is no public header for this struct, and the call only shows that the values are loaded from one eight-word structure, not which words are pointers. An extra trailing argument would be harmless under the o32 calling convention, but one in the middle would shift the `freqs`, `gains` and `qs` pointers and crash. The effect is off by default and exists only on T32 and T33.
 - Every effect is off by default on every camera, which explains how these mismatches went unnoticed.
 

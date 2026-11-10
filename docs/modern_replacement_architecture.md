@@ -318,3 +318,26 @@ Defects found while checking the modernisation. They are quality bugs, not accep
 - `audio_process_drc_eq_process` always processes `rate / 100` samples and has no length argument (an ABI property); a caller passing a shorter buffer would be read past its end. Confirm `libimp` always passes a full 10 ms frame, and consider documenting or guarding it.
 - HPF, LPF and DRC give identical output for 80-, 160- and 480-sample calls in both builds.
 
+### 4.7 Contract audit: how the vendor `libimp` uses each entry point (caller side)
+
+Method: for 38 `libimp.so` builds (one per SoC and SDK version, `gtxaspec/ingenic-lib` at `ea62f3d`), every `audio_process_*` name present in the binary was located, and its call sites were found by function slot (a static or code-built `{name, slot}` table, then `lw $25, slot; jalr`). Two states are kept apart: a name that is **not present** (not wired on that SoC) and a name that is **present but has no located call site** (marked `*`; it may be loaded and never called, or called in a way the script does not match). Only the caller side was read.
+
+| Entry point | Wired on | Located call sites | Caller-side contract seen | Matches this library |
+|---|---|---|---|---|
+| `aec_process` | all | all | `(handle, &frame)`; frame is a 16-byte stack object | yes |
+| `aec_create` | all | none located* | not established from binaries | unverified |
+| `ns_*`, `agc_*` | all | yes | `ns_process(h, in, 1, out)`, `set_config` 4/5 args; `agc_process` call sites located on most builds | NS yes; AGC arguments not re-derived here |
+| `hpf_create`, `hpf_process` | all | yes | `hpf_process(state, buf, count)` three arguments | yes |
+| `hpf_free`, `agc_get_config`, `ns_get_config` | all | none located* | loaded by `dlsym`; no call found | n/a |
+| `hs_process` | T23, T32, T33, T40, T41 (not T31, A1, C100, T20, T21, T30) | yes (19 builds) | **`(handle, buf, buf, n)` four arguments**; `n` loaded from offset 0x10 of an audio frame/attribute struct, most likely samples per frame | **no (three arguments)** |
+| `hs_create` | same as `hs_process` | none located on T23, T32, T33* | not established | unverified |
+| `drc_eq_process` | T32, T33 | yes | `(handle, in, out)` three arguments, no length | yes |
+| `drc_eq_set_config` | T32, T33 | yes | register arguments plus **five** stack arguments (nine in total) | **no? this library declares eight; recheck** |
+| `drc_create/set_config/process/free` | **T31** and T41 | yes (T31 `drc_create` and `drc_set_config` not located*) | not yet read | unverified |
+| `lpf_create`, `lpf_process` | T32, T33 | yes (through a `libimp` wrapper that halves a byte count) | not yet read | unverified |
+
+Findings from the audit:
+- The header comment ties plain DRC to "T41 ZRT", but `libimp` also references it on T31 builds (T31 is the main Thingino SoC), so DRC is a live code path on the most common camera, not a niche one.
+- `hs_process` argument-count mismatch and the `drc_eq_set_config` argument-count question are defects to resolve before anything is shipped that enables those effects. The latter is flagged, not confirmed: the stores were counted from one disassembly window and need a full trace.
+- Every effect is off by default on every camera, which explains how these mismatches went unnoticed.
+

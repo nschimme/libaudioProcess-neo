@@ -59,7 +59,10 @@ void  audio_process_lpf_free(void);
 
 /* HS (Howling Suppression) */
 void *audio_process_hs_create(int sample_rate, int frame_size);
-void  audio_process_hs_process(void *handle, int16_t *data, int num_samples);
+/* Two call shapes: vendor libimp passes (handle, buf, buf, num_bytes); the
+ * original shape is (handle, data, num_samples) with the fourth argument unused. */
+void  audio_process_hs_process(void *handle, int16_t *data, uintptr_t arg2,
+			       uintptr_t arg3);
 void  audio_process_hs_free(void *handle);
 
 /* DRC+EQ combined (T32) */

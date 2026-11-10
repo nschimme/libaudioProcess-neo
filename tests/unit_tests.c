@@ -244,7 +244,7 @@ static void test_howling_guardrails(void)
 	}
 
 	double initial_rms = compute_rms_i16(buf, 0, 128);
-	audio_process_hs_process(hs, buf, n);
+	audio_process_hs_process(hs, buf, (uintptr_t)n, 0);
 
 	/* Check that howling filter stays bounded and active */
 	for (int i = 0; i < n; i++) {
@@ -258,6 +258,89 @@ static void test_howling_guardrails(void)
 
 	audio_process_hs_free(hs);
 	free(buf);
+	printf("  -> PASS\n");
+}
+
+static void hs_run(int rate, int16_t *buf, int n, int chunk, int vendor_shape)
+{
+	void *hs = audio_process_hs_create(rate, chunk);
+	for (int i = 0; i < n; i += chunk) {
+		int c = (n - i < chunk) ? n - i : chunk;
+		if (vendor_shape)
+			audio_process_hs_process(hs, buf + i, (uintptr_t)(buf + i),
+						 (uintptr_t)c * sizeof(int16_t));
+		else
+			audio_process_hs_process(hs, buf + i, (uintptr_t)c, 0);
+	}
+	audio_process_hs_free(hs);
+}
+
+static void hs_tone(int16_t *b, int n, int rate, double hz)
+{
+	unsigned seed = 1;
+	for (int i = 0; i < n; i++) {
+		seed = seed * 1103515245u + 12345u;
+		double noise = (double)((int)((seed >> 16) & 0x7fff) - 16384) * 0.02;
+		b[i] = (int16_t)(12000.0 * sin(2.0 * M_PI * hz * i / rate) + noise);
+	}
+}
+
+/* Test 6b: HS must work for any call length and either call shape (regression:
+ * it used to ignore everything but whole 128-sample blocks and did nothing
+ * for 80-sample calls at 8 kHz). */
+static void test_howling_call_shapes(void)
+{
+	printf("Running test_howling_call_shapes...\n");
+	const int rates[2] = {8000, 16000};
+	const int chunks[2] = {80, 160}; /* one 10 ms call, as libimp slices it */
+
+	for (int r = 0; r < 2; r++) {
+		int rate = rates[r], n = rate * 3;
+		int16_t *orig = malloc(n * sizeof(int16_t));
+		int16_t *ref = malloc(n * sizeof(int16_t));
+		int16_t *b = malloc(n * sizeof(int16_t));
+		hs_tone(orig, n, rate, 1000.0);
+
+		/* steady-state attenuation with the real call length */
+		memcpy(b, orig, n * sizeof(int16_t));
+		hs_run(rate, b, n, chunks[r], 0);
+		double before = compute_rms_i16(orig, n - 2000, n);
+		double after = compute_rms_i16(b, n - 2000, n);
+		ASSERT_TRUE(20.0 * log10(before / (after > 1.0 ? after : 1.0)) > 3.0,
+			    "HS attenuates a steady tone with 10 ms calls");
+
+		/* output must not depend on how the stream is cut into calls */
+		memcpy(ref, orig, n * sizeof(int16_t));
+		hs_run(rate, ref, n, n, 0);
+		const int cuts[4] = {80, 160, 100, 333};
+		for (int c = 0; c < 4; c++) {
+			memcpy(b, orig, n * sizeof(int16_t));
+			hs_run(rate, b, n, cuts[c], 0);
+			ASSERT_TRUE(memcmp(b, ref, n * sizeof(int16_t)) == 0,
+				    "HS output independent of call size");
+		}
+
+		/* vendor shape (handle, buf, buf, bytes) equals the original shape */
+		memcpy(b, orig, n * sizeof(int16_t));
+		hs_run(rate, b, n, chunks[r], 1);
+		ASSERT_TRUE(memcmp(b, ref, n * sizeof(int16_t)) == 0,
+			    "HS vendor call shape matches the sample-count shape");
+
+		/* separate output buffer through the pointer shape */
+		int16_t *out = calloc(n, sizeof(int16_t));
+		memcpy(b, orig, n * sizeof(int16_t));
+		void *hs = audio_process_hs_create(rate, chunks[r]);
+		for (int i = 0; i < n; i += chunks[r]) {
+			int c = (n - i < chunks[r]) ? n - i : chunks[r];
+			audio_process_hs_process(hs, b + i, (uintptr_t)(out + i),
+						 (uintptr_t)c * sizeof(int16_t));
+		}
+		audio_process_hs_free(hs);
+		ASSERT_TRUE(memcmp(out, ref, n * sizeof(int16_t)) == 0,
+			    "HS with a separate output buffer matches");
+		free(out);
+		free(orig); free(ref); free(b);
+	}
 	printf("  -> PASS\n");
 }
 
@@ -851,6 +934,9 @@ int main(void)
 
 	test_howling_guardrails();
 	record_quality_gate("HS", "Feedback Notch Suppression", "> 3.0 dB", "5.4 dB", "PASS");
+
+	test_howling_call_shapes();
+	record_quality_gate("HS", "Any call length and both call shapes", "Bit-exact across cuts", "Bit-exact", "PASS");
 
 	test_extreme_audio_stress();
 	record_quality_gate("STRESS", "Full-scale Nyquist / Spikes", "Zero overflows", "Bit-bounded", "PASS");

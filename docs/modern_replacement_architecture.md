@@ -317,7 +317,7 @@ Defects found while checking the modernisation. They are quality bugs, not accep
 **Process.** Every module evaluation (AGC, AEC, and any later change) includes a defect sweep next to the quality scores: call-size independence (80, 160 and 480 samples per call), digital silence, full-scale input, 8 and 16 kHz, state reset, and in-place use. Every defect found goes in this section whether or not it is a regression.
 
 **Observations still to investigate (not yet classified as defects).**
-- AGC output depends on how the stream is cut into calls: on a modulated tone plus noise at 16 kHz, 80-sample and 160-sample calls differ by up to 566 counts in HEAD (6364 in `475278e`). `libimp` always calls with one 10 ms frame, so this may be harmless in practice; it needs a check against the AGC's intended frame size before it is called a bug or accepted.
+- AGC output depended on how the stream was cut into calls (up to 566 counts between 80 and 160-sample calls). Resolved: the rewritten AGC gives bit-identical output for any call size (section 4.8).
 - `audio_process_drc_eq_process` always processes `rate / 100` samples and has no length argument (an ABI property); a caller passing a shorter buffer would be read past its end. Confirm `libimp` always passes a full 10 ms frame, and consider documenting or guarding it.
 - HPF, LPF and DRC give identical output for 80-, 160- and 480-sample calls in both builds.
 
@@ -348,11 +348,13 @@ Findings from the audit:
 - Needed to settle it: the layout of the application-side struct (ask Thingino or the maintainer whether DRC+EQ has ever been enabled on T32 or T33 hardware and by what code), or behaviour of the vendor library, which this project does not read.
 - Until then, treat `drc_eq_set_config` as possibly ABI-incompatible with `libimp` on T32 and T33. The effect is off by default and exists only there.
 
-### 4.8 AGC evaluation (oracle `475278e` against HEAD; descriptive; does not change §4.2-§4.4)
+### 4.8 AGC evaluation (oracle `475278e` against the branch; descriptive; does not change §4.2-§4.4)
+
+In the first part of this section (the first development run, the tone gates and the first defect list) "HEAD" means the AGC before the rewrite (`7807a46`); the later part describes the rewritten AGC.
 
 **Rule, written before scoring.** Config: target 3, compression gain 9 (12 for the tone gates), limiter on, modes 2 and 3, 16 kHz, 10 ms calls. Data: TCD-VoIP clean reference clips resampled to 16 kHz, development speakers FA and MK (10 clips each); the test speakers FG and ML are untouched. Input levels (active-speech RMS) -45, -35, -25, -20, -15 dBFS; the first run used -8 dBFS and wrapped around int16 because speech peaks exceed full scale, so the levels were changed before any scored run. Metrics: M1 level error against `min(-target, level + gain cap)` (pass: median |error| at most 1.5 dB and at most 0.5 dB worse than the oracle); M2 gain smoothness, the standard deviation of the frame-to-frame gain change in active speech (pass: at most 1.25 times the oracle); M3 fidelity, Zimtohrli of the output divided by its mean applied gain against the input, full length, lag logged (pass: median change at least -0.05); M4 clipped samples (pass: no more than the oracle); M5 noise gain in pauses (pass: no more than the cap + 0.5 dB). Cross-correlation lag was 0 in all 200 runs, as expected for a gain stage.
 
-**Result on the development half: FAIL on M1, M2 and M4; M3 passes overall.**
+**First development run, before the fix: FAIL on M1, M2 and M4; M3 passes overall.**
 
 | Input level (dBFS RMS) | Mode 3: median \|level error\| oracle / HEAD (dB) | Gain-change std oracle / HEAD (dB) | Clipped samples oracle / HEAD | Zimtohrli change (HEAD - oracle) |
 |---|---|---|---|---|
@@ -406,4 +408,9 @@ Medians over 20 clips. In mode 2 the oracle itself is 3 dB below the ideal at -4
 - Config B: as on the development half, the level is +2.4 to +3.5 dB above the oracle (cap honoured; envelope effect at -20 dBFS) and the pause gain follows; in addition the ripple (M2) misses in the -50 dBFS bed (0.305 against a limit of 0.291, driven by the -45 dBFS level at 0.62), which the development half did not show.
 - Zimtohrli (config B, bed -60, mode 3, 40 clip-level pairs): median change -0.024, pass.
 - Net: the held-out result reproduces the development result for config A, apart from the same low-SNR pause level, and for config B it shows the same cap-related difference plus one low-SNR ripple miss. The pre-registered rule is not fully met; the deviations are the ones listed.
+
+**Further checks of the rewritten AGC (defect sweep).**
+- `set_config`: two calls before `process` give the same output as one, a call mid-stream with the same settings changes nothing, and a target change mid-stream ramps instead of stepping (the first rewrite reset the running state on every call, which would have dropped a +9 dB gain to 0 dB in the middle of speech; raptor's `set-agc` re-enables the AGC with new values while it runs, and it is not known whether `libimp` reuses the handle). Now only a change of sample rate restarts the state. Unit tests cover all three.
+- Rates 8, 16, 32 and 48 kHz with the 160-sample call shape that `libimp` uses at the higher rates: the tone locks at -3.0 dBFS peak at every rate, speech lands at the same level as the oracle in config A (-24.3 against -24.2 dBFS at -25 dBFS input), steady noise gets -2.3 dB, and the output does not depend on call size. (A first check with 10 ms calls at 32 and 48 kHz made the oracle look inactive; that was the call shape.)
+- Not yet covered: the multi-band path (`num_bands` above 1) has no test, and what `libimp` passes for `num_bands` has not been read.
 

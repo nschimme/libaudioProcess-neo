@@ -582,6 +582,68 @@ static void test_agc_regressions(void)
 		ASSERT_TRUE(gain_db > 30.5 && gain_db <= 40.5, "AGC reaches a gain above 30 dB on quiet bursts");
 	}
 
+	/* 7. set_config is harmless: twice before process equals once, a call
+	 * on a running stream with the same settings changes nothing, and a
+	 * change of target mid-stream ramps instead of stepping */
+	{
+		WebRtcAgcConfig c12 = { .targetLevelDbfs = 3, .compressionGaindB = 12, .limiterEnable = 1 };
+		WebRtcAgcConfig c10 = { .targetLevelDbfs = 10, .compressionGaindB = 12, .limiterEnable = 1 };
+		int16_t *u = malloc(n * sizeof(int16_t));
+		int16_t *v = malloc(n * sizeof(int16_t));
+		int16_t *w = malloc(n * sizeof(int16_t));
+		agc_modulated(u, n);
+		memcpy(v, u, n * sizeof(int16_t));
+		memcpy(w, u, n * sizeof(int16_t));
+		void *a1 = audio_process_agc_create();
+		void *a2 = audio_process_agc_create();
+		void *a3 = audio_process_agc_create();
+		audio_process_agc_set_config(a1, 0, 255, 2, 16000, c12);
+		audio_process_agc_set_config(a2, 0, 255, 2, 16000, c12);
+		audio_process_agc_set_config(a2, 0, 255, 2, 16000, c12);
+		audio_process_agc_set_config(a3, 0, 255, 2, 16000, c12);
+		int32_t mic = 100;
+		uint8_t sat = 0;
+		for (int i = 0; i < n; i += 160) {
+			const int16_t *ip;
+			int16_t *op;
+			ip = u + i; op = u + i;
+			audio_process_agc_process(a1, &ip, 1, 160, &op, mic, &mic, 0, &sat);
+			ip = v + i; op = v + i;
+			audio_process_agc_process(a2, &ip, 1, 160, &op, mic, &mic, 0, &sat);
+			if (i == n / 2)
+				audio_process_agc_set_config(a3, 0, 255, 2, 16000, c12); /* mid-stream, same settings */
+			ip = w + i; op = w + i;
+			audio_process_agc_process(a3, &ip, 1, 160, &op, mic, &mic, 0, &sat);
+		}
+		ASSERT_TRUE(memcmp(u, v, n * sizeof(int16_t)) == 0, "two set_config calls equal one");
+		ASSERT_TRUE(memcmp(u, w, n * sizeof(int16_t)) == 0, "set_config with the same settings mid-stream changes nothing");
+		audio_process_agc_free(a1); audio_process_agc_free(a2); audio_process_agc_free(a3);
+
+		/* target 3 -> 10 mid-stream on a steady tone: the 1 ms peaks fall as a ramp */
+		void *a4 = audio_process_agc_create();
+		audio_process_agc_set_config(a4, 0, 255, 2, 16000, c12);
+		for (int i = 0; i < n; i++)
+			u[i] = (int16_t)lrint(3000.0 * sin(2.0 * M_PI * 700.0 * i / 16000.0));
+		for (int i = 0; i < n; i += 160) {
+			const int16_t *ip = u + i;
+			int16_t *op = u + i;
+			if (i == n / 2)
+				audio_process_agc_set_config(a4, 0, 255, 2, 16000, c10);
+			audio_process_agc_process(a4, &ip, 1, 160, &op, mic, &mic, 0, &sat);
+		}
+		audio_process_agc_free(a4);
+		double worst = 1.0, prev = 0.0;
+		for (int b = n / 2 - 1600; b < n / 2 + 3200; b += 16) {
+			int mx = 1;
+			for (int k = 0; k < 16; k++)
+				if (abs(u[b + k]) > mx) mx = abs(u[b + k]);
+			if (prev > 0.0 && mx / prev < worst) worst = mx / prev;
+			prev = mx;
+		}
+		ASSERT_TRUE(worst > 0.6, "a target change mid-stream ramps and does not step");
+		free(u); free(v); free(w);
+	}
+
 	/* 5. stationary noise alone (most of a camera's life) is never boosted,
 	 * even with a large gain cap */
 	{

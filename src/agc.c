@@ -82,7 +82,8 @@ struct modern_agc {
 	int sub_pos;
 };
 
-static void agc_prepare(struct modern_agc *st)
+/* derive the constants from the configuration; leaves the running state alone */
+static void agc_params(struct modern_agc *st)
 {
 	float tgt = 32767.0f * powf(10.0f, -(float)st->config.targetLevelDbfs / 20.0f);
 	float mg = powf(10.0f, (float)st->config.compressionGaindB / 20.0f);
@@ -106,7 +107,11 @@ static void agc_prepare(struct modern_agc *st)
 	st->rel_shift = 0;
 	while ((float)(2 << st->rel_shift) <= blocks * 1.414f && st->rel_shift < 16)
 		st->rel_shift++;
+}
 
+/* forget the running state: unity gain, empty envelope */
+static void agc_reset(struct modern_agc *st)
+{
 	st->env = 0;
 	st->block_peak = 0;
 	st->gain = 1 << 22;
@@ -132,7 +137,8 @@ void *audio_process_agc_create(void)
 	st->config.targetLevelDbfs = 3;   /* -3 dBov */
 	st->config.compressionGaindB = 9; /* 9 dB boost */
 	st->config.limiterEnable = 1;     /* Limiter ON */
-	agc_prepare(st);
+	agc_params(st);
+	agc_reset(st);
 
 	return st;
 }
@@ -145,10 +151,13 @@ int audio_process_agc_set_config(void *agc, int min_level, int max_level,
 	if (!st)
 		return -1;
 
+	int rate = sample_rate > 0 ? sample_rate : 16000;
+	int rate_changed = rate != st->sample_rate;
+
 	st->min_level = min_level;
 	st->max_level = max_level;
 	st->mode = mode;
-	st->sample_rate = sample_rate > 0 ? sample_rate : 16000;
+	st->sample_rate = rate;
 	st->config = config;
 
 	/* Validate parameters */
@@ -161,7 +170,12 @@ int audio_process_agc_set_config(void *agc, int min_level, int max_level,
 	if (st->config.compressionGaindB > 90)
 		st->config.compressionGaindB = 90;
 
-	agc_prepare(st);
+	/* A call on a running stream (the same rate) only changes the
+	 * parameters: the envelope and gain carry on, and the gain ramp moves
+	 * to the new target without a step. Only a new rate restarts. */
+	agc_params(st);
+	if (rate_changed)
+		agc_reset(st);
 	return 0;
 }
 

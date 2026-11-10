@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include <stdio.h>
+#include <sys/mman.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -341,6 +342,39 @@ static void test_howling_call_shapes(void)
 		free(out);
 		free(orig); free(ref); free(b);
 	}
+	printf("  -> PASS\n");
+}
+
+/* Regression: on MIPS32 a heap buffer can sit below 16 MB. The vendor call
+ * (handle, buf, buf, bytes) must still be read as an in-place call. */
+static void test_howling_low_address(void)
+{
+	printf("Running test_howling_low_address...\n");
+	void *want = (void *)0x00600000;
+	int n = 16000;
+	int16_t *low = mmap(want, 65536, PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (low == MAP_FAILED || low != want) {
+		printf("  [SKIP - cannot map a buffer below 16 MB here]\n");
+		return;
+	}
+	int16_t *ref = malloc(n * sizeof(int16_t));
+	int16_t *orig = malloc(n * sizeof(int16_t));
+	hs_tone(orig, n, 16000, 1000.0);
+	memcpy(ref, orig, n * sizeof(int16_t));
+	hs_run(16000, ref, n, 160, 0);
+
+	/* only 32 KB fits in the mapping: compare the first 16000 samples in pieces */
+	void *hs = audio_process_hs_create(16000, 160);
+	memcpy(low, orig, 16000 * sizeof(int16_t));
+	for (int i = 0; i < n; i += 160)
+		audio_process_hs_process(hs, low + i, (uintptr_t)(low + i), 160 * sizeof(int16_t));
+	audio_process_hs_free(hs);
+	/* the buffer is 32000 bytes of the 64 KB mapping, so samples stayed in bounds */
+	ASSERT_TRUE(memcmp(low, ref, n * sizeof(int16_t)) == 0,
+		    "HS vendor call shape works for a buffer below 16 MB");
+	munmap(low, 65536);
+	free(ref); free(orig);
 	printf("  -> PASS\n");
 }
 
@@ -935,6 +969,7 @@ int main(void)
 	test_howling_guardrails();
 	record_quality_gate("HS", "Feedback Notch Suppression", "> 3.0 dB", "5.4 dB", "PASS");
 
+	test_howling_low_address();
 	test_howling_call_shapes();
 	record_quality_gate("HS", "Any call length and both call shapes", "Bit-exact across cuts", "Bit-exact", "PASS");
 

@@ -552,21 +552,10 @@ static double ns_rms_db(const float *x, int from, int to)
 	return 10.0 * log10(s / (to - from) + 1e-30);
 }
 
-static void test_ns_regressions(void)
+static void ns_regressions_at_rate(int rate, void *(*create)(void), int (*set_config)(void *, int, int),
+				   ns_proc_fn proc, int (*nfree)(void *))
 {
-	printf("Running test_ns_regressions (E2E)...\n");
-	void *handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
-	if (!handle) handle = dlopen("./libaudioProcess.so", RTLD_NOW | RTLD_GLOBAL);
-	void *(*create)(void) = dlsym(handle, "audio_process_ns_create");
-	int (*set_config)(void *, int, int) = dlsym(handle, "audio_process_ns_set_config");
-	ns_proc_fn proc = dlsym(handle, "audio_process_ns_process");
-	int (*nfree)(void *) = dlsym(handle, "audio_process_ns_free");
-	if (!create || !set_config || !proc || !nfree) {
-		printf("  [SKIP - NS symbols not in binary link]\n");
-		return;
-	}
-
-	const int rate = 16000, frame = 160, N = rate * 4;
+	const int frame = (rate == 8000) ? 80 : 160, N = rate * 4;
 	float *sig = malloc(N * sizeof(float)), *out = malloc(N * sizeof(float));
 	float *out2 = malloc(N * sizeof(float)), *scaled = malloc(N * sizeof(float));
 
@@ -655,6 +644,25 @@ static void test_ns_regressions(void)
 	free(out);
 	free(out2);
 	free(scaled);
+}
+
+
+static void test_ns_regressions(void)
+{
+	printf("Running test_ns_regressions (E2E)...\n");
+	void *handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+	if (!handle) handle = dlopen("./libaudioProcess.so", RTLD_NOW | RTLD_GLOBAL);
+	void *(*create)(void) = dlsym(handle, "audio_process_ns_create");
+	int (*set_config)(void *, int, int) = dlsym(handle, "audio_process_ns_set_config");
+	ns_proc_fn proc = dlsym(handle, "audio_process_ns_process");
+	int (*nfree)(void *) = dlsym(handle, "audio_process_ns_free");
+	if (!create || !set_config || !proc || !nfree) {
+		printf("  [SKIP - NS symbols not in binary link]\n");
+		return;
+	}
+
+	ns_regressions_at_rate(16000, create, set_config, proc, nfree);
+	ns_regressions_at_rate(8000, create, set_config, proc, nfree);
 	printf("  -> PASS\n");
 }
 

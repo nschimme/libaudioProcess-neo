@@ -266,6 +266,16 @@ static void complex_fft(float *__restrict__ a, size_t m, int isgn)
 	}
 }
 
+/* The tables are built once when the library is loaded (dlopen runs this single
+ * threaded), not lazily on the first transform. The NS runs on libimp's capture
+ * thread and the software AEC on raptor's, and both use this FFT: a lazy build
+ * guarded by a plain flag could be entered by two threads at once, and on a
+ * weakly ordered CPU (MIPS) the flag can become visible before the table data. */
+__attribute__((constructor)) static void audio_process_fft_load(void)
+{
+	init_tables();
+}
+
 void audio_process_rdft(size_t n, int isgn, float *a)
 {
 	if (!a || (n != 128 && n != 256 && n != 512 && n != 1024))

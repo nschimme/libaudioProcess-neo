@@ -386,20 +386,34 @@ static void test_ns_guardrails(void)
 
 	int res = fn_ns_set_config(ns, 16000, 2); /* policy 2 = aggressive */
 	ASSERT_TRUE(res == 0, "ns set config");
+
+	/* Accepted values match the vendor library: only 8/16/32/48 kHz and policies 0-3,
+	 * with the result normalised to exactly 0 or -1. */
+	{
+		int ok_rates[] = {8000, 16000, 32000, 48000}, bad_rates[] = {0, 11025, 22050, 24000, 44100, 96000, -16000};
+		for (int i = 0; i < 4; i++)
+			for (int p = 0; p <= 3; p++)
+				ASSERT_TRUE(fn_ns_set_config(ns, ok_rates[i], p) == 0, "ns accepts 8/16/32/48 kHz with policy 0-3");
+		for (int i = 0; i < 7; i++)
+			ASSERT_TRUE(fn_ns_set_config(ns, bad_rates[i], 2) == -1, "ns rejects unsupported sample rates with -1");
+		ASSERT_TRUE(fn_ns_set_config(ns, 16000, -1) == -1, "ns rejects negative policy with -1");
+		ASSERT_TRUE(fn_ns_set_config(ns, 16000, 4) == -1, "ns rejects policy > 3 with -1");
+		ASSERT_TRUE(fn_ns_set_config(NULL, 16000, 2) == -1, "ns set_config on NULL returns -1");
+		ASSERT_TRUE(fn_ns_set_config(ns, 16000, 2) == 0, "ns usable again after rejected configs");
+	}
 	if (fn_ns_get_config) fn_ns_get_config();
 
 	/* Multi-rate & multi-policy guardrail verification */
 	/* Frame contract (libimp hands over 160-float band buffers, 80 at 8 kHz):
-	 *  - one band per call at every rate, 160 samples (80 at 8 kHz; 24 kHz is an
-	 *    extension that keeps a full-rate 10 ms band of 240), and
+	 *  - one band per call at every rate, 160 samples (80 at 8 kHz), and
 	 *  - WebRTC-style pre-split bands (2 at 32 kHz, 3 at 48 kHz), also 160 each. */
 	struct { int rate; int bands; } cases[] = {
-		{8000, 1}, {16000, 1}, {24000, 1}, {32000, 1}, {48000, 1}, {32000, 2}, {48000, 3}
+		{8000, 1}, {16000, 1}, {32000, 1}, {48000, 1}, {32000, 2}, {48000, 3}
 	};
-	for (int r = 0; r < 7; r++) {
+	for (int r = 0; r < 6; r++) {
 		int rate = cases[r].rate;
 		int num_bands = cases[r].bands;
-		int frame_len = (rate == 8000) ? 80 : (rate == 24000) ? 240 : 160;
+		int frame_len = (rate == 8000) ? 80 : 160;
 		float *in_f[3], *out_f[3];
 		const float *inp[3];
 		float *outp[3];

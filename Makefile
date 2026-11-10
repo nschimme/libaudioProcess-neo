@@ -42,6 +42,9 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.c
 clean:
 	rm -f $(OBJS) $(TARGET) $(TARGET_A)
 
+abi-check: $(TARGET)
+	@sh scripts/check_abi.sh $(TARGET) $(CROSS_COMPILE)nm
+
 size: $(TARGET)
 	@ls -lh $(TARGET)
 	@readelf -d $(TARGET) | grep NEEDED

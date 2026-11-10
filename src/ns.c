@@ -88,16 +88,18 @@ void *audio_process_ns_create(void)
 	return st;
 }
 
-/* Samples per call and band. The real caller (libimp) hands over 160-float band
- * buffers (80 at 8 kHz) at 8/16/32/48 kHz, exactly as WebRTC's NS block length;
- * 24/44.1 kHz are not used by libimp and keep a full-rate 10 ms band. */
+/* Samples consumed per call: the NS takes no length parameter, so every call
+ * must consume exactly one block of band 0 (80 samples at 8 kHz, 160 at 16 kHz
+ * and above), the same block length as WebRTC's NS. Slicing the capture stream
+ * into blocks is the caller's job. Returns 0 for a rate the vendor library
+ * rejects (anything other than 8/16/32/48 kHz). */
 static int ns_band_len(int sample_rate)
 {
 	if (sample_rate == 8000)
 		return 80;
 	if (sample_rate == 16000 || sample_rate == 32000 || sample_rate == 48000)
 		return NS_BAND_LEN;
-	return sample_rate / 100;
+	return 0;
 }
 
 /* (Re)initialise the analysis state for a given band length. */
@@ -146,9 +148,18 @@ int audio_process_ns_set_config(void *ns, int sample_rate, int policy)
 	if (!st)
 		return -1;
 
-	st->sample_rate = sample_rate > 0 ? sample_rate : 16000;
+	/* Same observable behaviour as the vendor wrapper (WebRtcNs_Init, then
+	 * WebRtcNs_set_policy, result normalised to exactly 0 or -1): an unsupported
+	 * rate fails before anything changes; a valid rate re-initialises the state,
+	 * and an out-of-range policy then fails without being applied. */
+	int len = ns_band_len(sample_rate);
+	if (len == 0)
+		return -1;
+	st->sample_rate = sample_rate;
+	ns_setup(st, len);
+	if (policy < 0 || policy > 3)
+		return -1;
 	st->policy = policy;
-	ns_setup(st, ns_band_len(st->sample_rate));
 	return 0;
 }
 

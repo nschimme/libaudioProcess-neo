@@ -219,18 +219,16 @@ static void hd_filter(struct hd_state *s, int16_t *buf, int pos, int n)
  *  - vendor libimp: hs_process(handle, buf, buf, num_bytes): the same pointer
  *    twice (in place) and a byte count;
  *  - this library's and openimp's original shape: hs_process(handle, data,
- *    num_samples), where the third argument is a small count.
+ *    num_samples), where the third argument is a sample count of any size.
  * The vendor call is recognised by pointer equality, which holds wherever the
- * buffer lives (on MIPS32 a heap buffer can sit below 16 MB). Otherwise a
- * third argument below HS_MAX_COUNT is a sample count (real counts are a few
- * thousand), and anything larger is read as a distinct output pointer with the
- * fourth argument in bytes.
+ * buffer lives (on MIPS32 a heap buffer can sit below 16 MB, and a count can
+ * be large, so no size threshold can tell the shapes apart). Every other call
+ * is the sample-count shape.
  *
  * Any length is processed: samples are filtered as they arrive, the
  * 128-sample analysis block fills across calls, and the notches found from a
  * completed block apply from the next sample on.
  */
-#define HS_MAX_COUNT 65536
 void audio_process_hs_process(void *handle, int16_t *data, uintptr_t arg2,
 			      uintptr_t arg3)
 {
@@ -239,17 +237,10 @@ void audio_process_hs_process(void *handle, int16_t *data, uintptr_t arg2,
 		return;
 
 	int n;
-	if (arg2 == (uintptr_t)data) {
+	if (arg2 == (uintptr_t)data)
 		n = (int)(arg3 / sizeof(int16_t));
-	} else if (arg2 < HS_MAX_COUNT) {
+	else
 		n = (int)arg2;
-	} else {
-		int16_t *out = (int16_t *)arg2;
-		n = (int)(arg3 / sizeof(int16_t));
-		if (n > 0)
-			memmove(out, data, (size_t)n * sizeof(int16_t));
-		data = out;
-	}
 	if (n <= 0)
 		return;
 

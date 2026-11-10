@@ -327,20 +327,22 @@ static void test_howling_call_shapes(void)
 		ASSERT_TRUE(memcmp(b, ref, n * sizeof(int16_t)) == 0,
 			    "HS vendor call shape matches the sample-count shape");
 
-		/* separate output buffer through the pointer shape */
-		int16_t *out = calloc(n, sizeof(int16_t));
-		memcpy(b, orig, n * sizeof(int16_t));
-		void *hs = audio_process_hs_create(rate, chunks[r]);
-		for (int i = 0; i < n; i += chunks[r]) {
-			int c = (n - i < chunks[r]) ? n - i : chunks[r];
-			audio_process_hs_process(hs, b + i, (uintptr_t)(out + i),
-						 (uintptr_t)c * sizeof(int16_t));
-		}
-		audio_process_hs_free(hs);
-		ASSERT_TRUE(memcmp(out, ref, n * sizeof(int16_t)) == 0,
-			    "HS with a separate output buffer matches");
-		free(out);
 		free(orig); free(ref); free(b);
+	}
+	/* one call with a very large sample count, as the throughput benchmark makes */
+	{
+		const int big = 131072;
+		int16_t *o = malloc(big * sizeof(int16_t));
+		int16_t *r = malloc(big * sizeof(int16_t));
+		hs_tone(o, big, 16000, 1000.0);
+		memcpy(r, o, big * sizeof(int16_t));
+		hs_run(16000, r, big, big, 0);
+		int16_t *c = malloc(big * sizeof(int16_t));
+		memcpy(c, o, big * sizeof(int16_t));
+		hs_run(16000, c, big, 160, 0);
+		ASSERT_TRUE(memcmp(c, r, big * sizeof(int16_t)) == 0,
+			    "HS handles one call with a count above 65536");
+		free(o); free(r); free(c);
 	}
 	printf("  -> PASS\n");
 }
